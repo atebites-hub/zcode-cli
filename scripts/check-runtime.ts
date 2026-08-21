@@ -7,8 +7,10 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { formatVersionOutput, readDistributionVersion } from "../src/launcher.ts";
 import {
+  hasRuntimeHttpNoContentGuard,
   patchRuntimeContextCacheFromParts,
   patchRuntimeGoalFailurePause,
+  patchRuntimeHttpNoContent,
   patchRuntimeLoginModelDefaults,
   supportsMultiMessageFileRewind
 } from "./sync-runtime.ts";
@@ -38,6 +40,9 @@ const runtimeSource = await Bun.file(runtime).text();
 if (patchRuntimeLoginModelDefaults(runtimeSource) !== runtimeSource
   || patchRuntimeContextCacheFromParts(runtimeSource) !== runtimeSource
   || patchRuntimeGoalFailurePause(runtimeSource) !== runtimeSource
+  || patchRuntimeHttpNoContent(runtimeSource) !== runtimeSource
+  || !hasRuntimeHttpNoContentGuard(runtimeSource)
+  || !runtimeSource.includes("nSi(e.projection,t?.cache)??t")
   || !runtimeSource.includes('"plugin://"')
   || !runtimeSource.includes('return await import("playwright-core")')
   || !runtimeSource.includes('pluginsReferenceCatalog:"plugins/referenceCatalog"')
@@ -78,6 +83,7 @@ if (patchRuntimeLoginModelDefaults(runtimeSource) !== runtimeSource
   || !/previewFileRewind:[A-Za-z_$][\w$]*\.previewFileRewind/u.test(runtimeSource)
   || !/applyFileRewind:[A-Za-z_$][\w$]*\.applyFileRewind/u.test(runtimeSource)
   || !/listSkills:[A-Za-z_$][\w$]*\.listSkills/u.test(runtimeSource)
+  || !/listModelOptions:[A-Za-z_$][\w$]*\.listModelOptions/u.test(runtimeSource)
   || !/subscribeSessionEvents:[A-Za-z_$][\w$]*\.subscribeSessionEvents/u.test(runtimeSource)
   || !/sendBackgroundTaskMessage:[A-Za-z_$][\w$]*\.sendBackgroundTaskMessage/u.test(runtimeSource)) {
   throw new Error("The runtime compatibility patches are missing; run `bun run sync` again.");
