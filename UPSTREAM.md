@@ -60,6 +60,8 @@ These are atebites-only. Do not drop them in an upstream merge without recording
 
 Required factory patch ids in `runtimePatchPlan`: `usage-footer`, `route-selection`, `runtime-attestation`, `strict-advisor-hooks`. Optional: `context-cache-from-parts`.
 
+On the 3.11.2 tip, `route-selection` restore-policy input and `strict-advisor-hooks` foreground empty-output anchors were retargeted (minified locals + extra restore-call args + hook `{output,diagnostics}` unwrap). `context-cache-from-parts` still skips as expected.
+
 ## Deferred (intentionally not in this fork yet)
 
 | Item | Reason |

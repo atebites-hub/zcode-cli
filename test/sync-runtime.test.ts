@@ -181,8 +181,8 @@ describe("runtime synchronization", () => {
   test("restored child route keeps the persisted parent policy and lite authority", async () => {
     const runtime = await Bun.file(new URL("../vendor/zcode.cjs", import.meta.url)).text();
     const patched = patchRuntimeRouteSelection(runtime);
-    expect(patched).toContain('__zcodeRouteRole:l.role==="lite"||o.parentID?"lite":"main"');
-    expect(patched).toContain('__zcodeRoutePolicySource:l.policySource==="parent"||o.parentID?"parent":"persisted"');
+    expect(patched).toMatch(/__zcodeRouteRole:[A-Za-z_$][\w$]*\.role==="lite"\|\|[A-Za-z_$][\w$]*\.parentID\?"lite":"main"/u);
+    expect(patched).toMatch(/__zcodeRoutePolicySource:[A-Za-z_$][\w$]*\.policySource==="parent"\|\|[A-Za-z_$][\w$]*\.parentID\?"parent":"persisted"/u);
     expect(patched).toContain('__zcodeRouteRole:t.__zcodeRouteRole??"main"');
     expect(patched).toContain('n.runtimeConfig?.__zcodeRouteRole==="lite"?"lite":"main"');
   });
