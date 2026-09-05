@@ -1,5 +1,20 @@
 # Configuration
 
+## Prompt Access Preflight
+
+Ordinary TUI input and new headless `--prompt`, `--print`, `-p`, and `--target`
+requests diagnose a clearly keyless Z.AI/BigModel Coding Plan configuration
+before starting a model turn. The TUI restores rejected input to an empty editor,
+or retains it in the follow-up queue without replacing a newer draft. Rejected
+queued input keeps its position and metadata; auto-send pauses until user action.
+Headless commands exit unsuccessfully with setup instructions.
+
+This is deliberately not a general credentials validator. Custom endpoints,
+environment authentication/model overrides, ancestor project configurations,
+dotenv files, and resumed headless sessions remain the runtime's responsibility.
+Login, setup, help, and other management commands remain available. No credentials
+are printed, changed, or tested over the network by this check.
+
 This document covers the detailed model-access configuration for
 zcode-app-cli. For installation and basic usage, see the
 [main README](../README.md).
@@ -189,18 +204,14 @@ PDF, or video input:
 
 | Field | Type | Purpose |
 | --- | --- | --- |
-| `attachment` | boolean | When `true`, the model accepts file/image attachments. This is the flag the bundled catalog uses for vision models such as `glm-5v-turbo`. |
-| `supportsImages` | boolean | Explicit image-input gate. The runtime drops image blocks for models where this resolves to `false`. |
-| `supportsPdf` | boolean | PDF input gate. |
-| `supportsVideo` | boolean | Video input gate. |
-| `modalities.input` | string[] | Enumerated input modalities: `text`, `audio`, `image`, `video`, `pdf`. |
+| `modalities.input` | string[] | Enumerated input modalities: `text`, `audio`, `image`, `video`, `pdf`. Image, PDF, and video support are derived from this list. |
 | `modalities.output` | string[] | Enumerated output modalities (usually `["text"]`). |
 | `limit.context` | number | Context window in tokens. |
 | `limit.output` | number | Max output tokens. |
 
-Any one of `attachment: true`, `supportsImages: true`, or listing `"image"`
-under `modalities.input` is sufficient — they are equivalent paths the
-runtime checks. Declaring all three is the safest, most readable form.
+Listing `"image"` under `modalities.input` is all that is needed to enable
+image attachments — the runtime derives the capability gates from the input
+list, so no separate capability flags are required.
 
 To add `glm-5.3-flash` as a multimodal model under the `zai` provider:
 
@@ -218,12 +229,8 @@ To add `glm-5.3-flash` as a multimodal model under the `zai` provider:
       "models": {
         "glm-5.3-flash": {
           "name": "GLM-5.3-Flash",
-          "attachment": true,
-          "supportsImages": true,
-          "supportsPdf": true,
-          "supportsVideo": true,
           "modalities": {
-            "input": ["text", "image", "video", "pdf"],
+            "input": ["text", "image", "video"],
             "output": ["text"]
           },
           "limit": { "context": 1000000, "output": 128000 }
@@ -251,9 +258,9 @@ After saving, verify the picker sees the capability:
 
 Attach an image from the clipboard with `Ctrl+V` or `/paste-image`; pending
 images appear as `[Image #N]` tokens above the editor and are sent with the
-next prompt. The runtime silently drops image blocks for models that resolve
-`supportsImages` to `false`, so a vision model is required to actually send
-the attachment upstream.
+next prompt. The runtime silently drops image blocks for models whose
+`modalities.input` does not include `image`, so a vision model is required to
+actually send the attachment upstream.
 
 ### Using the custom provider
 
@@ -463,3 +470,11 @@ export ZCODE_TUI_NOTIFICATION_METHOD=auto       # auto|osc9|bel|native|off
 export ZCODE_TUI_NOTIFICATION_CONDITION=always  # unfocused|always
 zcode
 ```
+
+## Official MCP Availability
+
+When the bundled runtime has no official MCP trusted-origin registry, official
+HTTP MCP services are reported as disabled with an `official_auth_unavailable`
+diagnostic. Other plugin components remain available. This does not disable
+certificate, origin, or permission checks, and does not suppress services when
+the runtime provides the required registry. No user configuration is rewritten.

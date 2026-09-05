@@ -413,6 +413,7 @@ async function runOverride(
 }
 
 describe("launcher/runtime integration", () => {
+<<<<<<< HEAD
   test("removes private override directories across runtime lifecycle exits", async () => {
     for (const mode of ["success", "nonzero", "signal"] as const) {
       const result = await runOverride(mode);
@@ -421,6 +422,25 @@ describe("launcher/runtime integration", () => {
       if (mode === "nonzero") expect(result.code).toBe(9);
     }
   }, 30_000);
+=======
+  test("rejects a keyless prompt before starting the runtime or creating a session", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "zcode-keyless-prompt-"));
+    const fakeNode = join(directory, "fake-node");
+    await writeFile(fakeNode, "#!/bin/sh\nprintf 'RUNTIME_STARTED'\nexit 99\n");
+    await chmod(fakeNode, 0o755);
+    try {
+      const result = await run(["--cwd", directory, "--prompt", "offline test"], "", {
+        HOME: directory, USERPROFILE: directory, ZCODE_NODE: fakeNode, ANTHROPIC_API_KEY: ""
+      });
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("No model request was sent");
+      expect(result.stdout).not.toContain("RUNTIME_STARTED");
+      expect(await Bun.file(join(directory, ".zcode", "cli", "db", "db.sqlite")).exists()).toBe(false);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+>>>>>>> upstream/main
 
   test("keeps TUI runtime diagnostics out of the interactive terminal", async () => {
     const directory = await mkdtemp(join(tmpdir(), "zcode-launcher-stderr-"));
@@ -457,7 +477,10 @@ describe("launcher/runtime integration", () => {
       expect(failed.stderr).toContain(`Diagnostics: ${logPath}`);
       expect(failed.stderr).not.toContain("ProviderBusinessError");
 
-      const print = await run(["--print", "hello"], "", { ZCODE_NODE: fakeNode });
+      const print = await run(["--print", "hello"], "", {
+        ZCODE_NODE: fakeNode,
+        ANTHROPIC_API_KEY: "fixture-only-key"
+      });
       expect(print.code).toBe(0);
       expect(print.stderr).toContain("ProviderBusinessError");
     } finally {

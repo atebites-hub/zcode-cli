@@ -13,14 +13,20 @@ import {
   hasRuntimeCliHelpContract,
   hasRuntimeHttpNoContentGuard,
   hasRuntimeNetworkRetryGuard,
+  hasRuntimeStreamEofFinishGuard,
   patchRuntimeGoalFailurePause,
   patchRuntimeHttpNoContent,
   patchRuntimeLoginModelDefaults,
   patchRuntimeAttestation,
   patchRuntimeContextCacheFromParts,
   patchRuntimeNetworkRetryClassification,
+<<<<<<< HEAD
   patchRuntimeRouteSelection,
   patchRuntimeStrictAdvisorHooks,
+=======
+  patchRuntimeOfficialMcpAvailability,
+  patchRuntimeStreamEofFinishGuard,
+>>>>>>> upstream/main
   parseRuntimePatchReports,
   runtimePatchPlan,
   supportsMultiMessageFileRewind
@@ -72,6 +78,7 @@ if (!metadataCapabilities
   throw new Error("The extracted runtime capability manifest is missing or stale; run `bun run sync` again.");
 }
 if (patchRuntimeLoginModelDefaults(runtimeSource) !== runtimeSource
+<<<<<<< HEAD
   || (patchEnabled("context-cache-from-parts")
     && (patchRuntimeContextCacheFromParts(runtimeSource) !== runtimeSource
       || !runtimeSource.includes("nSi(e.projection,t?.cache)??t")))
@@ -89,11 +96,16 @@ if (patchRuntimeLoginModelDefaults(runtimeSource) !== runtimeSource
       || !runtimeSource.includes("function __zcodeStrictAdvisorHookFailureMessage")
       || !runtimeSource.includes("let _zcodeSendResult=await t.app.sendInput({attachments:")))
   || (patchEnabled("usage-footer") && !runtimeSource.includes("zcode_usage"))
+=======
+  || (patchEnabled("official-mcp-availability") && patchRuntimeOfficialMcpAvailability(runtimeSource) !== runtimeSource)
+>>>>>>> upstream/main
   || (patchEnabled("goal-failure-pause") && patchRuntimeGoalFailurePause(runtimeSource) !== runtimeSource)
   || patchRuntimeHttpNoContent(runtimeSource) !== runtimeSource
   || !hasRuntimeHttpNoContentGuard(runtimeSource)
   || patchRuntimeNetworkRetryClassification(runtimeSource) !== runtimeSource
   || !hasRuntimeNetworkRetryGuard(runtimeSource)
+  || patchRuntimeStreamEofFinishGuard(runtimeSource) !== runtimeSource
+  || !hasRuntimeStreamEofFinishGuard(runtimeSource)
   || (patchEnabled("cli-help-contract") && !hasRuntimeCliHelpContract(runtimeSource))
   || !runtimeSource.includes(".readRuntimeProjection=async()=>{let $zRuntimeProjectionBridge=await ")
   || !runtimeSource.includes('"plugin://"')
