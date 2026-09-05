@@ -118,7 +118,7 @@ jobs:
           name: validated-release-${{ github.run_id }}
           path: release-artifact
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 3
 
   publish:
     needs: validate

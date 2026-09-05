@@ -1,0 +1,49 @@
+name: Cleanup Actions artifacts
+
+on:
+  schedule:
+    # Weekly Monday sweep (UTC). Complements retention-days: 3 on uploads.
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+concurrency:
+  group: zcode-cli-cleanup-artifacts
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Delete artifacts older than 3 days
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          readonly MAX_AGE_DAYS=3
+          readonly MAX_AGE_SECONDS=$((MAX_AGE_DAYS * 24 * 60 * 60))
+          deleted=0
+
+          while IFS= read -r id; do
+            [[ -z "$id" ]] && continue
+            if ! output="$(gh api --method DELETE "repos/${GITHUB_REPOSITORY}/actions/artifacts/${id}" 2>&1)"; then
+              if [[ "$output" == *"HTTP 404"* ]]; then
+                echo "Already deleted artifact ${id}"
+                continue
+              fi
+              echo "$output" >&2
+              exit 1
+            fi
+            echo "Deleted artifact ${id}"
+            deleted=$((deleted + 1))
+          done < <(
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
+              --jq ".artifacts[] | select((.created_at | fromdateiso8601) < (now - ${MAX_AGE_SECONDS})) | .id"
+          )
+
+          echo "Deleted ${deleted} artifact(s) older than ${MAX_AGE_DAYS} days."
+          echo "Deleted ${deleted} artifact(s) older than ${MAX_AGE_DAYS} days." >> "$GITHUB_STEP_SUMMARY"
