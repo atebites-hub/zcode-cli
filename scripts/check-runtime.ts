@@ -13,14 +13,17 @@ import {
   hasRuntimeCliHelpContract,
   hasRuntimeHttpNoContentGuard,
   hasRuntimeNetworkRetryGuard,
+  hasRuntimeStreamEofFinishGuard,
   patchRuntimeGoalFailurePause,
   patchRuntimeHttpNoContent,
   patchRuntimeLoginModelDefaults,
   patchRuntimeAttestation,
   patchRuntimeContextCacheFromParts,
   patchRuntimeNetworkRetryClassification,
+  patchRuntimeOfficialMcpAvailability,
   patchRuntimeRouteSelection,
   patchRuntimeStrictAdvisorHooks,
+  patchRuntimeStreamEofFinishGuard,
   parseRuntimePatchReports,
   runtimePatchPlan,
   supportsMultiMessageFileRewind
@@ -89,11 +92,14 @@ if (patchRuntimeLoginModelDefaults(runtimeSource) !== runtimeSource
       || !runtimeSource.includes("function __zcodeStrictAdvisorHookFailureMessage")
       || !runtimeSource.includes("let _zcodeSendResult=await t.app.sendInput({attachments:")))
   || (patchEnabled("usage-footer") && !runtimeSource.includes("zcode_usage"))
+  || (patchEnabled("official-mcp-availability") && patchRuntimeOfficialMcpAvailability(runtimeSource) !== runtimeSource)
   || (patchEnabled("goal-failure-pause") && patchRuntimeGoalFailurePause(runtimeSource) !== runtimeSource)
   || patchRuntimeHttpNoContent(runtimeSource) !== runtimeSource
   || !hasRuntimeHttpNoContentGuard(runtimeSource)
   || patchRuntimeNetworkRetryClassification(runtimeSource) !== runtimeSource
   || !hasRuntimeNetworkRetryGuard(runtimeSource)
+  || patchRuntimeStreamEofFinishGuard(runtimeSource) !== runtimeSource
+  || !hasRuntimeStreamEofFinishGuard(runtimeSource)
   || (patchEnabled("cli-help-contract") && !hasRuntimeCliHelpContract(runtimeSource))
   || !runtimeSource.includes(".readRuntimeProjection=async()=>{let $zRuntimeProjectionBridge=await ")
   || !runtimeSource.includes('"plugin://"')

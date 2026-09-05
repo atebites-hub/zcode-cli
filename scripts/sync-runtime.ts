@@ -410,6 +410,26 @@ export function patchRuntimeCliHelpContract(runtime: string): string {
   return patched;
 }
 
+/** Report missing official authentication support without weakening origin checks. */
+export function patchRuntimeOfficialMcpAvailability(runtime: string): string {
+  const marker = "zcode_cli_official_mcp_unavailable";
+  if (runtime.includes(marker)) return runtime;
+  const anchor = /await this\.closeRecord\(([A-Za-z_$][\w$]*)\),([A-Za-z_$][\w$]*)\.enabled===!1\)\{let ([A-Za-z_$][\w$]*)=this\.createStatus\(\2,"disabled"\);/gu;
+  let matches = 0;
+  const patched = runtime.replace(anchor, (_, name: string, config: string, status: string) => {
+    matches += 1;
+    const unavailable = `${config}.type==="http"&&${config}.auth?.type==="zcode_official"`
+      + `&&${config}.auth.provider==="jwt_token"&&${config}.official!==void 0`
+      + "&&!this.officialMcpAuth?.trustedOrigins";
+    return `await this.closeRecord(${name}),${config}.enabled===!1||(${unavailable})){`
+      + `let ${status}=this.createStatus(${config},"disabled",${config}.enabled===!1?void 0:`
+      + `{error:"Official MCP authentication is unavailable in this runtime (${marker}).",`
+      + 'failureKind:"official_auth_unavailable"});';
+  });
+  if (matches !== 1) throw new Error("ZCode runtime is incompatible with the official MCP availability patch.");
+  return patched;
+}
+
 /** Keep short Agent calls inline, but detach long-running agents from the foreground turn. */
 export function patchRuntimeAgentAutoBackground(runtime: string): string {
   const marker = "autoBackgroundMs:this.config.subagents?.autoBackgroundMs??1e3,outputRootDir:";
@@ -1217,6 +1237,94 @@ export function patchRuntimeNetworkRetryClassification(runtime: string): string 
   return patched;
 }
 
+const runtimeStreamEofFinishGuard = [
+  "function $zStreamEofFinishGuard(e){return(e.finishReason===void 0||e.finishReason===\"other\")&&",
+  "e.rawFinishReason==null&&(e.textDeltaChars>0||e.toolCallCount>0||e.reasoningDeltaChars>0||",
+  "(e.chunkCounts?.[\"tool-input-start\"]??0)>0||(e.chunkCounts?.[\"tool-input-delta\"]??0)>0||",
+  "(e.chunkCounts?.[\"tool-input-end\"]??0)>0)}"
+].join("");
+
+/** Detect the EOF finish guard that downgrades silent stream truncation to retryable failures. */
+export function hasRuntimeStreamEofFinishGuard(runtime: string): boolean {
+  return runtime.includes(runtimeStreamEofFinishGuard)
+    && /if\(\$zStreamEofFinishGuard\([A-Za-z_$][\w$]*\)&&![A-Za-z_$][\w$]*\)throw Object\.assign\(new Error\("Model stream ended before a finish reason \(EOF\)\."\),\{name:"ModelStreamIdleTimeoutError",code:"MODEL_STREAM_IDLE_TIMEOUT",idleMs:0,timeoutMs:0\}\);if\([A-Za-z_$][\w$]*\(\{/u.test(runtime);
+}
+
+/**
+ * A provider stream that ends without a finish reason after emitting partial
+ * content (graceful FIN, no `[DONE]`, no error chunk) settles the turn as a
+ * normal completion and headless runs can exit 0 with an incomplete answer.
+ * Reclassify that EOF as an idle-timeout-shaped stream failure so the existing
+ * model and turn-level recovery machinery discards the incomplete attempt.
+ */
+export function patchRuntimeStreamEofFinishGuard(runtime: string): string {
+  if (hasRuntimeStreamEofFinishGuard(runtime)) return runtime;
+
+  const completionGatePattern = /if\(([A-Za-z_$][\w$]*)\(([A-Za-z_$][\w$]*)\)\)\{let ([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)\(\{providerId:String\(([A-Za-z_$][\w$]*)\.model\.providerId\),providerKind:\5\.providerKind,source:\2\.lastErrorChunk/u;
+
+  const completionGate = completionGatePattern.exec(runtime);
+  if (!completionGate) {
+    throw new Error("ZCode runtime is incompatible with the stream EOF guard patch (empty-completion gate anchor missing).");
+  }
+  const completionDiagnosticsName = completionGate[2]!;
+  if (countRegExpMatches(runtime, completionGatePattern) !== 1) {
+    throw new Error("ZCode runtime is incompatible with the stream EOF guard patch (empty-completion gate is not unique).");
+  }
+
+  const completionTailPattern = new RegExp(
+    `streamOutputCommitted:!1\\}\\);continue\\}\\}\\}if\\(([A-Za-z_$][\\w$]*)\\(\\{attempt:([A-Za-z_$][\\w$]*),diagnostics:${escapeRegExpName(completionDiagnosticsName)},durationMs:Date\\.now\\(\\)-([A-Za-z_$][\\w$]*),emittedError:([A-Za-z_$][\\w$]*)`,
+    "u"
+  );
+  const completionTail = completionTailPattern.exec(runtime);
+  if (!completionTail || completionTail.index < completionGate.index) {
+    throw new Error("ZCode runtime is incompatible with the stream EOF guard patch (completion success anchor missing).");
+  }
+  if (countRegExpMatches(runtime, completionTailPattern) !== 1) {
+    throw new Error("ZCode runtime is incompatible with the stream EOF guard patch (completion success anchor is not unique).");
+  }
+  const diagnosticsName = completionDiagnosticsName;
+  const completionLoggerName = completionTail[1]!;
+  const emittedErrorName = completionTail[4]!;
+
+  // The guard is declared at module scope (before the runStreamText generator)
+  // because the completion-tail call site lives in a sibling block. A
+  // provider-supplied raw finish reason is authoritative; only the SDK's
+  // synthetic `other` finish with no raw reason is treated as EOF.
+  // "async " precedes the generator declaration; anchor on it so the guard
+  // lands before the `async` keyword instead of splitting it.
+  const runStreamTextPattern = /async function\*([A-Za-z_$][\w$]*)\(e\)\{let ([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)\(/u;
+  const runStreamText = runStreamTextPattern.exec(runtime);
+  if (!runStreamText || countRegExpMatches(runtime, runStreamTextPattern) !== 1) {
+    throw new Error("ZCode runtime is incompatible with the stream EOF guard patch (runStreamText anchor missing).");
+  }
+  const runStreamTextAnchor = runStreamText[0]!;
+  // Providers that die mid-stream (or map a null finish_reason) surface the
+  // AI SDK's "other" finish reason with no raw reason. Only content-bearing
+  // or unfinished tool-input streams are treated as partial output here;
+  // the existing empty-completion path owns truly empty responses.
+  let patched = runtime.replace(
+    runStreamTextAnchor,
+    `${runtimeStreamEofFinishGuard}async function*${runStreamText[1]}(e){let ${runStreamText[2]}=${runStreamText[3]}(`
+  );
+  if (patched === runtime) {
+    throw new Error("ZCode runtime is incompatible with the stream EOF guard patch (runStreamText anchor missing).");
+  }
+
+  // Do not emit `model_request_completed` for an EOF without a provider
+  // finish reason. The idle-timeout-shaped failure is classified by the
+  // runtime's existing retry/recovery machinery, which discards any
+  // already-visible attempt.
+  patched = patched.replace(
+    `streamOutputCommitted:!1});continue}}}if(${completionLoggerName}(`,
+    `streamOutputCommitted:!1});continue}}}if($zStreamEofFinishGuard(${diagnosticsName})&&!${emittedErrorName})throw Object.assign(new Error("Model stream ended before a finish reason (EOF)."),{name:"ModelStreamIdleTimeoutError",code:"MODEL_STREAM_IDLE_TIMEOUT",idleMs:0,timeoutMs:0});if(${completionLoggerName}(`
+  );
+
+  if (!hasRuntimeStreamEofFinishGuard(patched)) {
+    throw new Error("ZCode runtime stream EOF guard patch failed postcondition verification.");
+  }
+  return patched;
+}
+
 export function patchRuntimeZaiDesktopOAuth(runtime: string): string {
   if (runtime.includes('ZCODE_CLI_OAUTH_CALLBACK_STDIN==="1"')) return runtime;
 
@@ -1380,6 +1488,11 @@ const terminalProjectionMarkers = [
 
 export const runtimePatchPlan: readonly RuntimePatchDefinition[] = [
   {
+    id: "official-mcp-availability",
+    requirement: "optional",
+    apply: patchRuntimeOfficialMcpAvailability
+  },
+  {
     id: "tui-bridge",
     requirement: "required",
     apply: patchRuntimeTuiBridge,
@@ -1429,6 +1542,12 @@ export const runtimePatchPlan: readonly RuntimePatchDefinition[] = [
     requirement: "required",
     apply: patchRuntimeNetworkRetryClassification,
     verify: hasRuntimeNetworkRetryGuard
+  },
+  {
+    id: "stream-eof-finish-guard",
+    requirement: "required",
+    apply: patchRuntimeStreamEofFinishGuard,
+    verify: hasRuntimeStreamEofFinishGuard
   },
   {
     id: "oauth-http-errors",
@@ -1662,10 +1781,22 @@ export function patchRuntimeRouteSelection(runtime: string): string {
     "session route persistence",
     /await ([A-Za-z_$][\w$]*)\(this,t\),this.sessionPersisted=!0,this.logger\?\.debug\("Session persisted"/u
   );
+  // 3.10.2 used fixed minified names (`l`/`u`/`c`/`o`/`i`) and a 2-arg restore
+  // call. 3.11.2 renamed those locals and now passes session/host/trace tails
+  // after the options object; capture identifiers and stop at `workspace:`.
   const restoreCall = matchOnce(
     "restore policy input",
-    /l&&\(u.model=l.model,u.thoughtLevel=l.thoughtLevel,u.thoughtSource="session_entry"\);let c=await ([A-Za-z_$][\w$]*)\(e,\{\.\.\.t,mode:u.mode,model:([A-Za-z_$][\w$]*)\(t.runtimeModel,u.model\),\.\.\.o.parentID\?\{parentSessionId:String\(o.parentID\)\}:\{\},workspace:i\}/u
+    /([A-Za-z_$][\w$]*)&&\(([A-Za-z_$][\w$]*)\.model=\1\.model,\2\.thoughtLevel=\1\.thoughtLevel,\2\.thoughtSource="session_entry"\);let ([A-Za-z_$][\w$]*)=await ([A-Za-z_$][\w$]*)\(([A-Za-z_$][\w$]*),\{\.\.\.([A-Za-z_$][\w$]*),mode:\2\.mode,model:([A-Za-z_$][\w$]*)\(\6\.runtimeModel,\2\.model\),\.\.\.([A-Za-z_$][\w$]*)\.parentID\?\{parentSessionId:String\(\8\.parentID\)\}:\{\},workspace:([A-Za-z_$][\w$]*)\}/u
   );
+  const restoreEntry = restoreCall[1]!;
+  const restoreState = restoreCall[2]!;
+  const restoreResult = restoreCall[3]!;
+  const restoreFn = restoreCall[4]!;
+  const restoreEnv = restoreCall[5]!;
+  const restoreInput = restoreCall[6]!;
+  const restoreModelMerge = restoreCall[7]!;
+  const restoreSession = restoreCall[8]!;
+  const restoreWorkspace = restoreCall[9]!;
   const restoredAvailability = matchOnce(
     "restored policy availability",
     /([A-Za-z_$][\w$]*)=t.taskType\?\?"interactive",_=n&&!p&&!([A-Za-z_$][\w$]*)\(e,([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*)\),([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)\(t.mcpServers\);/u
@@ -1790,7 +1921,7 @@ export function patchRuntimeRouteSelection(runtime: string): string {
   replaceOnce(
     "restore policy input",
     restoreCall[0]!,
-    `l&&(u.model=l.model,u.thoughtLevel=l.thoughtLevel,u.thoughtSource="session_entry");let c=await ${restoreCall[1]!}(e,{...t,mode:u.mode,model:${restoreCall[2]!}(t.runtimeModel,u.model),...l?.rolePolicy?{__zcodeRolePolicy:l.rolePolicy,__zcodeRouteRole:l.role==="lite"||o.parentID?"lite":"main",__zcodeRoutePolicySource:l.policySource==="parent"||o.parentID?"parent":"persisted"}:{__zcodeDisableAdvisorOverlay:!0},...o.parentID?{parentSessionId:String(o.parentID)}:{},workspace:i}`
+    `${restoreEntry}&&(${restoreState}.model=${restoreEntry}.model,${restoreState}.thoughtLevel=${restoreEntry}.thoughtLevel,${restoreState}.thoughtSource="session_entry");let ${restoreResult}=await ${restoreFn}(${restoreEnv},{...${restoreInput},mode:${restoreState}.mode,model:${restoreModelMerge}(${restoreInput}.runtimeModel,${restoreState}.model),...${restoreEntry}?.rolePolicy?{__zcodeRolePolicy:${restoreEntry}.rolePolicy,__zcodeRouteRole:${restoreEntry}.role==="lite"||${restoreSession}.parentID?"lite":"main",__zcodeRoutePolicySource:${restoreEntry}.policySource==="parent"||${restoreSession}.parentID?"parent":"persisted"}:{__zcodeDisableAdvisorOverlay:!0},...${restoreSession}.parentID?{parentSessionId:String(${restoreSession}.parentID)}:{},workspace:${restoreWorkspace}}`
   );
   replaceOnce(
     "restore policy runtime config",
@@ -2006,9 +2137,11 @@ export function patchRuntimeStrictAdvisorHooks(runtime: string): string {
     return match;
   };
 
+  // 3.11.2 unwraps the callback through `{output,diagnostics}=Nni(v)` before
+  // timing; keep the fail-closed empty-output check on the raw return value.
   const foregroundEmpty = matchOnce(
     "foreground empty output",
-    /let v=await this.runCallbackWithTimeout\(d,t,c,r.signal\),x=Date.now\(\)-_,w=([A-Za-z_$][\w$]*)\(t.hookEventName,v\);/u
+    /let v=await this.runCallbackWithTimeout\(d,t,c,r.signal\),\{output:x,diagnostics:w\}=([A-Za-z_$][\w$]*)\(v\),b=Date.now\(\)-_,k=([A-Za-z_$][\w$]*)\(t.hookEventName,x\);/u
   );
   const foregroundFail = matchOnce(
     "foreground failure",
@@ -2059,8 +2192,8 @@ export function patchRuntimeStrictAdvisorHooks(runtime: string): string {
   );
   replaceOnce(
     "foreground empty output",
-    "let v=await this.runCallbackWithTimeout(d,t,c,r.signal),x=Date.now()-_,",
-    'let v=await this.runCallbackWithTimeout(d,t,c,r.signal);if(__zcodeIsStrictAdvisorHook(d)&&v===void 0)throw new Error("ZCODE_STRICT_ADVISOR_HOOK_FAILURE: empty output");let x=Date.now()-_,'
+    foregroundEmpty[0]!,
+    `let v=await this.runCallbackWithTimeout(d,t,c,r.signal);if(__zcodeIsStrictAdvisorHook(d)&&v===void 0)throw new Error("ZCODE_STRICT_ADVISOR_HOOK_FAILURE: empty output");let {output:x,diagnostics:w}=${foregroundEmpty[1]!}(v),b=Date.now()-_,k=${foregroundEmpty[2]!}(t.hookEventName,x);`
   );
   replaceOnce(
     "foreground failure",
