@@ -37,7 +37,9 @@
   },
   "model": {
     "main": "zai/glm-5.2",
-    "lite": "zai/glm-5-turbo"
+    "mainThoughtLevel": "max",
+    "lite": "zai/glm-5-turbo",
+    "liteThoughtLevel": "enabled"
   },
   "modelCatalog": {
     "overrides": {}

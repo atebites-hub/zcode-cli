@@ -16,7 +16,11 @@ import {
   patchRuntimeGoalFailurePause,
   patchRuntimeHttpNoContent,
   patchRuntimeLoginModelDefaults,
+  patchRuntimeAttestation,
+  patchRuntimeContextCacheFromParts,
   patchRuntimeNetworkRetryClassification,
+  patchRuntimeRouteSelection,
+  patchRuntimeStrictAdvisorHooks,
   parseRuntimePatchReports,
   runtimePatchPlan,
   supportsMultiMessageFileRewind
@@ -68,6 +72,23 @@ if (!metadataCapabilities
   throw new Error("The extracted runtime capability manifest is missing or stale; run `bun run sync` again.");
 }
 if (patchRuntimeLoginModelDefaults(runtimeSource) !== runtimeSource
+  || (patchEnabled("context-cache-from-parts")
+    && (patchRuntimeContextCacheFromParts(runtimeSource) !== runtimeSource
+      || !runtimeSource.includes("nSi(e.projection,t?.cache)??t")))
+  || (patchEnabled("route-selection")
+    && (patchRuntimeRouteSelection(runtimeSource) !== runtimeSource
+      || !runtimeSource.includes("ZCODE_RUNTIME_ROUTE_UNSUPPORTED_THOUGHT_LEVEL")
+      || !runtimeSource.includes('__zcodeRoutePolicySource:"parent"')))
+  || (patchEnabled("runtime-attestation")
+    && (patchRuntimeAttestation(runtimeSource) !== runtimeSource
+      || !runtimeSource.includes("ZCODE_ODW_RUNTIME_ATTESTATION")
+      || !runtimeSource.includes('type:"zcode_runtime_attestation"')))
+  || (patchEnabled("strict-advisor-hooks")
+    && (patchRuntimeStrictAdvisorHooks(runtimeSource) !== runtimeSource
+      || !runtimeSource.includes("ZCODE_STRICT_ADVISOR_HOOK_FAILURE")
+      || !runtimeSource.includes("function __zcodeStrictAdvisorHookFailureMessage")
+      || !runtimeSource.includes("let _zcodeSendResult=await t.app.sendInput({attachments:")))
+  || (patchEnabled("usage-footer") && !runtimeSource.includes("zcode_usage"))
   || (patchEnabled("goal-failure-pause") && patchRuntimeGoalFailurePause(runtimeSource) !== runtimeSource)
   || patchRuntimeHttpNoContent(runtimeSource) !== runtimeSource
   || !hasRuntimeHttpNoContentGuard(runtimeSource)

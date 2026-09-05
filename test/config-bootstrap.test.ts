@@ -45,10 +45,16 @@ describe("user config bootstrap", () => {
     const env = homeEnvironment(home);
     const result = await ensureUserConfig(env);
     const config = JSON.parse(await readFile(result.configPath, "utf8")) as {
-      model: { lite: string; main: string };
+      model: {
+        lite: string;
+        liteThoughtLevel: string;
+        main: string;
+        mainThoughtLevel: string;
+      };
       modelStream: { idleTimeoutMs: number };
       provider: { zai: { options: { apiKey?: string }; models: Record<string, unknown> } };
       subagents: { autoBackgroundMs: number };
+      hooks: { enabled: boolean; timeoutMs: number; maxOutputBytes: number; events: Record<string, unknown[]> };
     };
 
     expect(result).toEqual({ configPath: userConfigPath(env), created: true });
@@ -56,9 +62,28 @@ describe("user config bootstrap", () => {
     expect(config.provider.zai.models["glm-5.2"]).toBeDefined();
     expect(config.provider.zai.models["glm-5.1"]).toBeDefined();
     expect(config.provider.zai.models["glm-5-turbo"]).toBeDefined();
-    expect(config.model).toEqual({ main: "zai/glm-5.2", lite: "zai/glm-5-turbo" });
+    expect(config.model).toEqual({
+      main: "zai/glm-5.2",
+      mainThoughtLevel: "max",
+      lite: "zai/glm-5-turbo",
+      liteThoughtLevel: "enabled"
+    });
     expect(config.modelStream.idleTimeoutMs).toBe(60_000);
     expect(config.subagents.autoBackgroundMs).toBe(1_000);
+    expect(config.hooks).toEqual({
+      enabled: false,
+      timeoutMs: 60_000,
+      maxOutputBytes: 32_768,
+      events: {
+        SessionStart: [],
+        UserPromptSubmit: [],
+        PreToolUse: [],
+        PermissionRequest: [],
+        PostToolUse: [],
+        PostToolUseFailure: [],
+        Stop: []
+      }
+    });
     expect(await readConfiguredModelAccess(env)).toBeNull();
 
     if (process.platform !== "win32") {

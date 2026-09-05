@@ -87,6 +87,14 @@ The official runtime directly owns raw terminal mode, IME cursor placement and
 resize handling; the launcher does not insert a second PTY or relay terminal
 bytes.
 
+Strict consumers such as Advisor are opt-in. They must obtain user approval
+before enabling their Plugin, preserve unrelated user hooks and configuration,
+reject handler/path collisions, start a new session, verify handler failures
+are fail-closed, and verify the runtime attestation on every accepted primary
+and native child execution. ZCode's shipped user default remains
+`{"hooks":{"enabled":false}}`; Plugin-owned handlers are independent of that
+default and must not silently enable unrelated user hooks.
+
 ## Features
 
 **Editor and input.** pi-tui differential rendering with a CJK-aware

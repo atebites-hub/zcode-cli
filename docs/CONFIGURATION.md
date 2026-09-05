@@ -159,13 +159,23 @@ Set both roles to keep all work on the custom provider:
 {
   "model": {
     "main": "zai/your-model-id",
-    "lite": "zai/your-model-id"
+    "mainThoughtLevel": "high",
+    "lite": "zai/your-model-id",
+    "liteThoughtLevel": "high"
   }
 }
 ```
 
-`main` is the normal conversation model. `lite` is used for lightweight and
-subagent work. Model IDs are case-sensitive and must match the endpoint.
+`main` and `mainThoughtLevel` select the primary role. `lite` and
+`liteThoughtLevel` select lightweight and native Agent/subagent work. Model IDs
+are case-sensitive, and each thought-level value must be exposed by that model
+in the model catalog. An unsupported value fails before a provider request.
+
+A new session can optionally take both role pairs from the one enabled
+`sol-advisor@sol-advisor` Plugin record. Its `advisor_model`, `advisor_effort`,
+`grunt_model`, and `grunt_effort` options must all be present. Disabled,
+incomplete, malformed, or ambiguous Advisor records leave ordinary ZCode
+routing unchanged.
 
 The no-login TUI path currently requires a non-empty `options.apiKey` in the
 local config; an environment-only API key does not satisfy the upstream login
@@ -229,9 +239,9 @@ To add `glm-5.3-flash` as a multimodal model under the `zai` provider:
 ```
 
 Then point `model.main` (and optionally `model.lite`) at the new id. The
-`model` block stays strict — only `main` and `lite` are accepted; multimodal
-capability is declared in the provider catalog entry above, never inside
-`model`.
+`model` block stays strict: `main`, `lite`, and optional
+`mainThoughtLevel` / `liteThoughtLevel`. Multimodal capability is declared
+in the provider catalog entry above, never inside `model`.
 
 After saving, verify the picker sees the capability:
 
@@ -264,10 +274,22 @@ Use these commands inside the TUI:
 /new                           # start a new session with the configured default
 ```
 
-The status line should show `zai/your-model-id`. Setting both `model.main` and
-`model.lite` in the config makes the custom provider the default for normal,
-lightweight and subagent work. A resumed session may retain its previous model,
-so use `/new` after changing the default.
+The status line should show `zai/your-model-id`. Setting both role pairs makes
+the custom provider the default for primary, lightweight, and subagent work.
+A running or restored Advisor session retains its recorded role pairs, so use
+`/new` after changing its Plugin settings or the default configuration.
+
+### Strict runtime consumers
+
+The shipped user configuration keeps hooks disabled by default:
+`{"hooks":{"enabled":false}}`. A strict consumer such as Advisor must obtain
+explicit approval before enabling its Plugin, contribute only Plugin-owned
+named handlers, preserve unrelated user configuration, and refuse handler or
+path collisions. It must start a new session, verify that its handlers run and
+fail closed on missing, crashing, timed-out, or malformed handlers before
+declaring strict support. Every accepted primary and native child execution
+must also verify the runtime-generated attestation, including its resolved
+model, effort, role, parent session, immutable policy, and fingerprint.
 
 Headless prompts use the same provider configuration:
 
