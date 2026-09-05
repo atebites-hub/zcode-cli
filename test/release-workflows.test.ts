@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { readdir } from "node:fs/promises";
 import { resolve } from "node:path";
 
 import { describe, expect, test } from "bun:test";
@@ -141,6 +142,7 @@ describe("release workflows", () => {
     expect(compatibilitySummary?.run).toContain('PHASE" == "runtime_discovery"');
     expect(compatibilityUpload?.if).toContain("runtime-compatibility.json");
     expect(compatibilityUpload?.with?.["if-no-files-found"]).toBe("error");
+    expect(compatibilityUpload?.with?.["retention-days"]).toBe(3);
     expect(compatibilityIssue?.if).toContain("steps.compatibility.outputs.actionable == 'true'");
     expect(compatibilityIssue?.run).toContain("gh issue edit");
     expect(compatibilityIssue?.run).toContain("gh issue create");
@@ -212,6 +214,7 @@ describe("release workflows", () => {
     expect(packageCheck?.run).toContain("bun run release:pack");
     expect(packageCheck?.run).toContain("cp .release/release.json");
     expect(upload?.with?.["if-no-files-found"]).toBe("error");
+    expect(upload?.with?.["retention-days"]).toBe(3);
     expect(upload?.with?.path).toBe("release-artifact");
     expect(download?.with?.name).toContain("needs.validate.outputs.artifact_name");
     expect(driftCheck?.run).toContain("git diff --exit-code -- package.json");
@@ -241,5 +244,52 @@ describe("release workflows", () => {
 
   test("removes the direct scheduled publishing workflow", () => {
     expect(existsSync(resolve(root, ".github", "workflows", "sync-and-publish.yml"))).toBe(false);
+  });
+
+  test("caps every Actions upload-artifact at 3 days", async () => {
+    const workflowDir = resolve(root, ".github", "workflows");
+    const files = (await readdir(workflowDir)).filter((name) => name.endsWith(".yml"));
+    let uploads = 0;
+
+    expect(files.length).toBeGreaterThan(0);
+    for (const name of files) {
+      const { workflow } = await readWorkflow(name);
+      for (const [jobName, job] of Object.entries(workflow.jobs)) {
+        for (const step of job.steps ?? []) {
+          if (!step.uses?.startsWith("actions/upload-artifact@")) continue;
+          uploads += 1;
+          expect({ file: name, job: jobName, retention: step.with?.["retention-days"] }).toEqual({
+            file: name,
+            job: jobName,
+            retention: 3
+          });
+        }
+      }
+    }
+
+    expect(uploads).toBeGreaterThan(0);
+  });
+
+  test("deletes Actions artifacts older than 3 days on a weekly schedule", async () => {
+    const { source, workflow } = await readWorkflow("cleanup-artifacts.yml");
+    const cleanup = workflow.jobs.cleanup!;
+    const deleteStep = cleanup.steps.find((step) => step.name === "Delete artifacts older than 3 days");
+
+    expect(workflow.on).toHaveProperty("schedule");
+    expect(workflow.on).toHaveProperty("workflow_dispatch");
+    expect(workflow.on.schedule).toEqual([{ cron: "17 4 * * 1" }]);
+    expect(workflow.permissions).toEqual({ actions: "write" });
+    expect(workflow.concurrency?.group).toBe("zcode-cli-cleanup-artifacts");
+    expect(workflow.concurrency?.["cancel-in-progress"]).toBe(false);
+    expect(cleanup["runs-on"]).toBe("ubuntu-latest");
+    expect(cleanup["timeout-minutes"]).toBe(10);
+    expect(deleteStep?.env?.GH_TOKEN).toBe("${{ github.token }}");
+    expect(deleteStep?.run).toContain("MAX_AGE_DAYS=3");
+    expect(deleteStep?.run).toContain("repos/${GITHUB_REPOSITORY}/actions/artifacts");
+    expect(deleteStep?.run).toContain("--method DELETE");
+    expect(deleteStep?.run).toContain("HTTP 404");
+    expect(source).not.toContain("secrets.");
+    expect(source).not.toContain("NPM_TOKEN");
+    expect(source).not.toContain("id-token: write");
   });
 });

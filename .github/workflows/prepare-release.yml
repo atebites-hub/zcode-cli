@@ -84,7 +84,7 @@ jobs:
             .release/runtime-compatibility.json
             .release/runtime-compatibility.md
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 3
 
       - name: Create or update runtime compatibility issue
         if: failure() && github.event_name == 'schedule' && steps.compatibility.outputs.actionable == 'true'
