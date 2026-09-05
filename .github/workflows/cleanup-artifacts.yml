@@ -27,6 +27,10 @@ jobs:
           readonly MAX_AGE_DAYS=3
           readonly MAX_AGE_SECONDS=$((MAX_AGE_DAYS * 24 * 60 * 60))
           deleted=0
+          stale_ids="$(
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
+              --jq ".artifacts[] | select((.created_at | fromdateiso8601) < (now - ${MAX_AGE_SECONDS})) | .id"
+          )"
 
           while IFS= read -r id; do
             [[ -z "$id" ]] && continue
@@ -40,10 +44,7 @@ jobs:
             fi
             echo "Deleted artifact ${id}"
             deleted=$((deleted + 1))
-          done < <(
-            gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
-              --jq ".artifacts[] | select((.created_at | fromdateiso8601) < (now - ${MAX_AGE_SECONDS})) | .id"
-          )
+          done <<< "$stale_ids"
 
           echo "Deleted ${deleted} artifact(s) older than ${MAX_AGE_DAYS} days."
           echo "Deleted ${deleted} artifact(s) older than ${MAX_AGE_DAYS} days." >> "$GITHUB_STEP_SUMMARY"
