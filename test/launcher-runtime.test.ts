@@ -413,7 +413,6 @@ async function runOverride(
 }
 
 describe("launcher/runtime integration", () => {
-<<<<<<< HEAD
   test("removes private override directories across runtime lifecycle exits", async () => {
     for (const mode of ["success", "nonzero", "signal"] as const) {
       const result = await runOverride(mode);
@@ -422,7 +421,7 @@ describe("launcher/runtime integration", () => {
       if (mode === "nonzero") expect(result.code).toBe(9);
     }
   }, 30_000);
-=======
+
   test("rejects a keyless prompt before starting the runtime or creating a session", async () => {
     const directory = await mkdtemp(join(tmpdir(), "zcode-keyless-prompt-"));
     const fakeNode = join(directory, "fake-node");
@@ -440,7 +439,6 @@ describe("launcher/runtime integration", () => {
       await rm(directory, { recursive: true, force: true });
     }
   });
->>>>>>> upstream/main
 
   test("keeps TUI runtime diagnostics out of the interactive terminal", async () => {
     const directory = await mkdtemp(join(tmpdir(), "zcode-launcher-stderr-"));

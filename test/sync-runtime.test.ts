@@ -26,14 +26,11 @@ import {
   patchRuntimeLoginModelDefaults,
   patchRuntimeNetworkRetryClassification,
   patchRuntimeOAuthHttpErrors,
-<<<<<<< HEAD
   patchRuntimeAttestation,
   patchRuntimeStrictAdvisorHooks,
   STRICT_ADVISOR_HOOK_FAILURE_MESSAGE_HELPER,
   patchRuntimeRouteSelection,
-=======
   patchRuntimeStreamEofFinishGuard,
->>>>>>> upstream/main
   patchRuntimeTerminalToolProjection,
   patchRuntimeTuiBridge,
   patchRuntimeUsageFooter,
@@ -1832,7 +1829,6 @@ describe("runtime synchronization", () => {
     expect(() => patchRuntimeGoalFailurePause("incompatible runtime")).toThrow(/incompatible/);
   });
 
-<<<<<<< HEAD
   test("injects a zcode_usage footer into the runPrompt non-JSON exit under ODW protocol", () => {
     // Hand-built fixture mirroring the real runPrompt exit: the JSON branch writes projection
     // totals, then the non-JSON branch writes `${W.response}\n`. The app var `f` (with .sessionId)
@@ -1962,7 +1958,8 @@ describe("runtime synchronization", () => {
     expect(patched).toContain("e.stdout.write(`${Q.response}");
     expect(patched).toContain("(X&&lFi(e,X),e.stdout.write(`${Q.response}");
     expect(patchRuntimeUsageFooter(patched)).toBe(patched);
-=======
+  });
+
   test("reclassifies a graceful mid-stream EOF without a finish reason as retryable", () => {
     const runtime = [
       "function detectFallback(e){return}",
@@ -2029,6 +2026,5 @@ describe("runtime synchronization", () => {
       reasoningDeltaChars: 0,
       chunkCounts: { "tool-input-start": 1 }
     })).toBe(true);
->>>>>>> upstream/main
   });
 });
