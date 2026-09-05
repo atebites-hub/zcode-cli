@@ -18,17 +18,24 @@ import {
   parseRuntimeLock,
   patchRuntimeAgentAutoBackground,
   patchRuntimeCliHelpContract,
+  patchRuntimeContextCacheFromParts,
   patchRuntimeDetachedAgentLifecycle,
   patchRuntimeGoalFailurePause,
   patchRuntimeHttpNoContent,
   patchRuntimeLoginModelDefaults,
   patchRuntimeNetworkRetryClassification,
   patchRuntimeOAuthHttpErrors,
+  patchRuntimeAttestation,
+  patchRuntimeStrictAdvisorHooks,
+  STRICT_ADVISOR_HOOK_FAILURE_MESSAGE_HELPER,
+  patchRuntimeRouteSelection,
   patchRuntimeTerminalToolProjection,
   patchRuntimeTuiBridge,
+  patchRuntimeUsageFooter,
   patchRuntimeZaiDesktopOAuth,
   resolveArtifactUrl,
   resolveLatestRuntimeLock,
+  runtimePatchPlan,
   selectRuntimeLock,
   serviceManifestUrl,
   serviceReleasePlatform,
@@ -42,7 +49,263 @@ import {
   syncedReleaseVersion
 } from "../scripts/release-version.ts";
 
+type RoutePolicy = {
+  advisorModel: string;
+  advisorEffort: string;
+  gruntModel: string;
+  gruntEffort: string;
+};
+
+function routeHarness(runtime: string) {
+  const patched = patchRuntimeRouteSelection(runtime);
+  const start = patched.indexOf("function __zcodeParseRoleModel");
+  const helperEnd = patched.indexOf("return{modelRef:l,thoughtLevel:c}}", start);
+  if (start < 0 || helperEnd < 0) throw new Error("runtime route helpers are missing");
+  const helpers = patched.slice(start, helperEnd + "return{modelRef:l,thoughtLevel:c}}".length);
+  const parseFn = /try\{return ([A-Za-z_$][\w$]*)\(e\)\}catch/.exec(helpers)?.[1];
+  const catalogFn = /o&&!([A-Za-z_$][\w$]*)\(l,o\)\.includes\(c\)/.exec(helpers)?.[1];
+  if (!parseFn || !catalogFn) throw new Error("runtime route helper dependencies are missing");
+  const load = new Function(parseFn, catalogFn, `${helpers};return {normalize:__zcodeNormalizeRolePolicy,resolve:__zcodeResolveAdvisorRolePolicy,select:__zcodeSelectRuntimeRole};`);
+  return load(
+    (value: string) => {
+      const slash = value.indexOf("/");
+      if (slash <= 0 || slash === value.length - 1) throw new Error("invalid model");
+      return { providerId: value.slice(0, slash), modelId: value.slice(slash + 1) };
+    },
+    (modelRef: { providerId: string; modelId: string }, catalog: Record<string, string[]>) =>
+      catalog[`${modelRef.providerId}/${modelRef.modelId}`] ?? []
+  ) as {
+    normalize(value: unknown): RoutePolicy | undefined;
+    resolve(value: unknown): RoutePolicy | undefined;
+    select(
+      modelRef: { providerId: string; modelId: string; variant?: string },
+      role: "main" | "lite",
+      modelConfig: { mainThoughtLevel?: string; liteThoughtLevel?: string } | undefined,
+      policy: RoutePolicy | undefined,
+      catalog?: Record<string, string[]>,
+    ): { modelRef: { providerId: string; modelId: string; variant?: string }; thoughtLevel?: string };
+  };
+}
+
+const policyA = {
+  advisorModel: "openai/advisor-a",
+  advisorEffort: "ultra",
+  gruntModel: "openai/grunt-a",
+  gruntEffort: "high"
+} satisfies RoutePolicy;
+
+const policyB = {
+  advisorModel: "openai/advisor-b",
+  advisorEffort: "max",
+  gruntModel: "openai/grunt-b",
+  gruntEffort: "medium"
+} satisfies RoutePolicy;
+
+const routeCatalog = {
+  "openai/advisor-a": ["high", "ultra"],
+  "openai/grunt-a": ["medium", "high"],
+  "openai/advisor-b": ["high", "max"],
+  "openai/grunt-b": ["medium", "high"],
+  "openai/main": ["high"],
+  "openai/lite": ["medium"]
+};
+
 describe("runtime synchronization", () => {
+  test("runtime attestation patch covers native lifecycle hook payloads", async () => {
+    const raw = await Bun.file(new URL("../vendor/zcode.cjs", import.meta.url)).text();
+    const runtime = raw.includes("zcode_usage") ? raw : patchRuntimeUsageFooter(raw);
+    const patched = patchRuntimeAttestation(runtime);
+    expect(patched).toContain("function __zcodeRuntimeAttestation");
+    expect(patched).toContain('type:"zcode_runtime_attestation"');
+    expect(patched).toContain('route:"native"');
+    expect(patched).toContain("rolePolicyFingerprint");
+    expect(patched).toContain("function __zcodeWriteOdwAttestation");
+    expect(patched).toContain("__zcodeRuntimeApp");
+    expect(patched).toMatch(/hookEventName:[A-Za-z_$][\w$]*\.SessionStart/);
+    expect(patched).toMatch(/hookEventName:[A-Za-z_$][\w$]*\.PreToolUse/);
+    expect(patched).toMatch(/hookEventName:[A-Za-z_$][\w$]*\.PostToolUse,/);
+    expect(patched).toMatch(/hookEventName:[A-Za-z_$][\w$]*\.PostToolUseFailure/);
+    expect(patched).toContain("runtimeAttestation:__zcodeRuntimeAttestation");
+    expect(patched).toContain("__zcodeDefineHidden");
+    expect(patched).toContain("__zcodeChildRuntimeEvidence");
+    expect(patched).toContain("childRuntimeEvidence");
+  });
+
+  test("runtime attestation patch is idempotent and rejects incompatible anchors", async () => {
+    const raw = await Bun.file(new URL("../vendor/zcode.cjs", import.meta.url)).text();
+    const runtime = raw.includes("zcode_usage") ? raw : patchRuntimeUsageFooter(raw);
+    const patched = patchRuntimeAttestation(runtime);
+    expect(patchRuntimeAttestation(patched)).toBe(patched);
+    expect(() => patchRuntimeAttestation("incompatible runtime")).toThrow(/anchor count 0/);
+  });
+
+  test("strict Advisor hook patch fails closed only for the exact plugin source", async () => {
+    const runtime = await Bun.file(new URL("../vendor/zcode.cjs", import.meta.url)).text();
+    const patched = patchRuntimeStrictAdvisorHooks(runtime);
+    expect(patched).toContain("function __zcodeIsStrictAdvisorHook");
+    expect(patched).toContain("function __zcodeStrictAdvisorHookFailureMessage");
+    expect(patched).toContain("ZCODE_STRICT_ADVISOR_HOOK_FAILURE");
+    expect(patched).toContain("let _zcodeSendResult=await t.app.sendInput({attachments:");
+    expect(patched).toContain("let _zcodeSendDone=_zcodeSendResult?.completion??_zcodeSendResult?.result");
+    expect(patched).toContain('t.restoreWarning={type:"zcode_strict_advisor_hook_failure",message:_zcodeStrictAdvisorHookFailure}');
+    expect(patchRuntimeStrictAdvisorHooks(patched)).toBe(patched);
+  });
+
+  test("strict Advisor protocol catch recovers the nested hook-failure message", () => {
+    const readMessage = new Function(
+      `${STRICT_ADVISOR_HOOK_FAILURE_MESSAGE_HELPER};return __zcodeStrictAdvisorHookFailureMessage;`
+    )() as (error: unknown) => string | undefined;
+    const inner = new Error("ZCODE_STRICT_ADVISOR_HOOK_FAILURE: empty output");
+    const wrapped = new Error("Turn execution failed", { cause: inner });
+    const doubleWrapped = new Error("Turn execution failed", { cause: wrapped });
+    expect(readMessage(inner)).toBe("ZCODE_STRICT_ADVISOR_HOOK_FAILURE: empty output");
+    expect(readMessage(wrapped)).toBe("ZCODE_STRICT_ADVISOR_HOOK_FAILURE: empty output");
+    expect(readMessage(doubleWrapped)).toBe("ZCODE_STRICT_ADVISOR_HOOK_FAILURE: empty output");
+    expect(readMessage(new Error("Turn execution failed"))).toBeUndefined();
+  });
+
+  test("runtime route patch wires the real resolver, persistence, restore, and Agent anchors", async () => {
+    const runtime = await Bun.file(new URL("../vendor/zcode.cjs", import.meta.url)).text();
+    const patched = patchRuntimeRouteSelection(runtime);
+
+    expect(patched).toContain("ZCODE_RUNTIME_ROUTE_UNSUPPORTED_THOUGHT_LEVEL");
+    expect(patched).toContain("__zcodeRolePolicy");
+    expect(patched).toContain("this.sessionPersisted=!0;let __zcodePersistPolicy=this.config.__zcodeRolePolicy");
+    expect(patched).toContain("rolePolicy:");
+    expect(patched).toContain('__zcodeRoutePolicySource:"parent"');
+    expect(patched).not.toContain('if(!f)throw new Error("ZCODE_RUNTIME_ROUTE_UNSUPPORTED_THOUGHT_LEVEL")');
+  });
+
+  test("restored child route keeps the persisted parent policy and lite authority", async () => {
+    const runtime = await Bun.file(new URL("../vendor/zcode.cjs", import.meta.url)).text();
+    const patched = patchRuntimeRouteSelection(runtime);
+    expect(patched).toContain('__zcodeRouteRole:l.role==="lite"||o.parentID?"lite":"main"');
+    expect(patched).toContain('__zcodeRoutePolicySource:l.policySource==="parent"||o.parentID?"parent":"persisted"');
+    expect(patched).toContain('__zcodeRouteRole:t.__zcodeRouteRole??"main"');
+    expect(patched).toContain('n.runtimeConfig?.__zcodeRouteRole==="lite"?"lite":"main"');
+  });
+
+  test("runtime route patch reads mainThoughtLevel for a primary session", async () => {
+    const runtime = await Bun.file(new URL("../vendor/zcode.cjs", import.meta.url)).text();
+    const route = routeHarness(runtime).select(
+      { providerId: "openai", modelId: "main" },
+      "main",
+      { mainThoughtLevel: "high" },
+      undefined,
+      routeCatalog,
+    );
+    expect(route.modelRef).toMatchObject({ modelId: "main", variant: "high" });
+  });
+
+  test("runtime route patch reads liteThoughtLevel for a subagent", async () => {
+    const runtime = await Bun.file(new URL("../vendor/zcode.cjs", import.meta.url)).text();
+    const route = routeHarness(runtime).select(
+      { providerId: "openai", modelId: "lite" },
+      "lite",
+      { liteThoughtLevel: "medium" },
+      undefined,
+      routeCatalog,
+    );
+    expect(route.modelRef).toMatchObject({ modelId: "lite", variant: "medium" });
+  });
+
+  test("runtime route patch applies the requested headless effort", async () => {
+    const runtime = await Bun.file(new URL("../vendor/zcode.cjs", import.meta.url)).text();
+    const route = routeHarness(runtime).select(
+      { providerId: "openai", modelId: "main" },
+      "main",
+      { mainThoughtLevel: "high" },
+      undefined,
+      routeCatalog,
+    );
+    expect(route.thoughtLevel).toBe("high");
+  });
+
+  test("new Advisor session snapshots main and lite tuples from plugin settings", async () => {
+    const runtime = await Bun.file(new URL("../vendor/zcode.cjs", import.meta.url)).text();
+    const harness = routeHarness(runtime);
+    const policy = harness.resolve({
+      enabled: true,
+      enabledPlugins: { "sol-advisor@sol-advisor": true },
+      options: {
+        "sol-advisor@sol-advisor": {
+          advisor_model: policyA.advisorModel,
+          advisor_effort: policyA.advisorEffort,
+          grunt_model: policyA.gruntModel,
+          grunt_effort: policyA.gruntEffort
+        }
+      }
+    });
+    expect(policy).toEqual(policyA);
+    expect(Object.isFrozen(policy)).toBe(true);
+  });
+
+  test("running Advisor session ignores later plugin setting changes", async () => {
+    const runtime = await Bun.file(new URL("../vendor/zcode.cjs", import.meta.url)).text();
+    const route = routeHarness(runtime).select(
+      { providerId: "openai", modelId: "advisor-b" },
+      "main",
+      undefined,
+      policyA,
+      routeCatalog,
+    );
+    expect(route.modelRef).toMatchObject({ modelId: "advisor-a", variant: "ultra" });
+  });
+
+  test("restored Advisor session reloads its persisted route snapshot", async () => {
+    const runtime = await Bun.file(new URL("../vendor/zcode.cjs", import.meta.url)).text();
+    const harness = routeHarness(runtime);
+    const persisted = harness.normalize(JSON.parse(JSON.stringify(policyA)));
+    expect(harness.select(
+      { providerId: "openai", modelId: "advisor-b" },
+      "main",
+      undefined,
+      persisted,
+      routeCatalog,
+    ).modelRef).toMatchObject({ modelId: "advisor-a", variant: "ultra" });
+  });
+
+  test("native Agent child inherits the parent's persisted lite tuple", async () => {
+    const runtime = await Bun.file(new URL("../vendor/zcode.cjs", import.meta.url)).text();
+    const route = routeHarness(runtime).select(
+      { providerId: "openai", modelId: "grunt-b" },
+      "lite",
+      undefined,
+      policyA,
+      routeCatalog,
+    );
+    expect(route.modelRef).toMatchObject({ modelId: "grunt-a", variant: "high" });
+  });
+
+  test("background resumed Agent child inherits the same lite tuple", async () => {
+    const runtime = await Bun.file(new URL("../vendor/zcode.cjs", import.meta.url)).text();
+    const harness = routeHarness(runtime);
+    const foreground = harness.select({ providerId: "openai", modelId: "grunt-b" }, "lite", undefined, policyA, routeCatalog);
+    const resumed = harness.select({ providerId: "openai", modelId: "grunt-b" }, "lite", undefined, policyA, routeCatalog);
+    expect(resumed.modelRef).toEqual(foreground.modelRef);
+  });
+
+  test("runtime route patch rejects an unsupported thought level before provider invocation", async () => {
+    const runtime = await Bun.file(new URL("../vendor/zcode.cjs", import.meta.url)).text();
+    expect(() => routeHarness(runtime).select(
+      { providerId: "openai", modelId: "advisor-a" },
+      "main",
+      undefined,
+      policyB,
+      { "openai/advisor-b": ["high"] },
+    )).toThrow("ZCODE_RUNTIME_ROUTE_UNSUPPORTED_THOUGHT_LEVEL");
+  });
+
+  test("runtime route patch is idempotent", async () => {
+    const runtime = await Bun.file(new URL("../vendor/zcode.cjs", import.meta.url)).text();
+    const patched = patchRuntimeRouteSelection(runtime);
+    expect(patchRuntimeRouteSelection(patched)).toBe(patched);
+  });
+
+  test("runtime route patch rejects incompatible anchors", () => {
+    expect(() => patchRuntimeRouteSelection("incompatible runtime")).toThrow(/config keys anchor count 0/);
+  });
+
   test("pins the exact remote runtime used by release workflows", async () => {
     const packageJson = await Bun.file(new URL("../package.json", import.meta.url)).json();
     const lock = await Bun.file(new URL("../zcode-runtime.lock.json", import.meta.url)).json();
@@ -468,6 +731,133 @@ describe("runtime synchronization", () => {
     );
   });
 
+  test("projects context cache usage from step-finish parts when message tokens are empty", () => {
+    const runtime = [
+      'function YRe(e){return typeof e=="number"&&Number.isInteger(e)&&e>=0?e:void 0}',
+      'function Loe(e){return typeof e=="number"&&Number.isInteger(e)&&e>0?e:void 0}',
+      'function Xki(e,t){return e}',
+      'function eSi(e){return}',
+      'function oSi(e,t){if(t<=0)return;let r=aSi(e);for(let n=e.length-1;n>=0;n-=1){let o=e[n];if(!o)continue;if(o.info.role==="user"&&o.info.summary){let a=o.parts.find(u=>u.type==="compaction"&&u.compactBoundary);if(a?.type==="compaction"&&a.compactBoundary){let u=Loe(a.compactBoundary.truePostCompactTokenCount??a.compactBoundary.postCompactTokenCount);if(u!==void 0)return{cost:null,size:t,used:u}}}if(o.info.role!=="assistant"||o.info.summary)continue;let i=iSi(o.info.tokens);if(i!==void 0)return{...r?{cache:r}:{},cost:null,size:t,used:i}}}',
+      'function nSi(e,t){if(!(e.contextUsed<=0||e.contextWindow<=0))return{...t?{cache:t}:{},cost:null,size:e.contextWindow,used:e.contextUsed}}',
+      'function aSi(e){let t=0,r=0,n=0,o=0,i=0,a=0,u=0;for(let l of e){if(l.info.role!=="assistant"||l.info.summary)continue;',
+      'let c=YRe(l.info.tokens.input)??0,d=YRe(l.info.tokens.cache.read)??0,p=YRe(l.info.tokens.cache.write)??0;',
+      'c<=0&&d<=0&&p<=0||(o+=1,t+=c,r+=d,n+=p,i=c,a=d,u=p)}',
+      'if(!(o<=0))return{inputTokens:i,cacheReadTokens:a,cacheWriteTokens:u,latestHitRate:i>0?a/i:null,hitRate:t>0?r/t:null,hitRateRequestCount:o,totalInputTokens:t,totalCacheReadTokens:r,totalCacheWriteTokens:n}}',
+      'function iSi(e){if(!e)return;let t=Loe(e.total);if(t!==void 0)return t;let r=Loe(e.input);if(r!==void 0)return r+(YRe(e.output)??0)}',
+      'function t5e(e){let t=oSi(e.messages,e.projection.contextWindow);return Xki(nSi(e.projection,t?.used===e.projection.contextUsed?t.cache:void 0)??t,eSi(e.persistedContextUsageBreakdownEvents??[]))}',
+      'function fda(e){return e}'
+    ].join("");
+    const patched = patchRuntimeContextCacheFromParts(runtime);
+    const context = new Function(`${patched};return {aggregate:aSi,project:t5e};`)() as {
+      aggregate: (
+        messages: Array<{
+          info: { role: string; summary?: string; tokens?: { input?: number; cache?: { read?: number; write?: number } } };
+          parts?: Array<{ type: string; tokens?: { input?: number; cache?: { read?: number; write?: number } } }>;
+        }>
+      ) => Record<string, unknown> | undefined;
+      project: (state: {
+        messages: Array<{
+          info: { role: string; summary?: string; tokens?: { input?: number; cache?: { read?: number; write?: number } } };
+          parts: Array<{ type: string; tokens?: { input?: number; cache?: { read?: number; write?: number } } }>;
+        }>;
+        persistedContextUsageBreakdownEvents?: unknown[];
+        projection: { contextUsed: number; contextWindow: number };
+      }) => Record<string, unknown> | undefined;
+    };
+    const aggregate = context.aggregate;
+
+    expect(patchRuntimeContextCacheFromParts(patched)).toBe(patched);
+    expect(() => patchRuntimeContextCacheFromParts("incompatible runtime")).toThrow(
+      /context-cache patch/
+    );
+
+    // Empty input: no messages with tokens or parts -> no cache block.
+    expect(aggregate([{ info: { role: "assistant", tokens: undefined }, parts: [] }])).toBeUndefined();
+
+    // Step-finish part fallback when message tokens are missing entirely.
+    const fromParts = aggregate([
+      {
+        info: { role: "assistant", tokens: undefined },
+        parts: [
+          { type: "step-start" },
+          { type: "step-finish", tokens: { input: 1000, cache: { read: 900, write: 0 } } }
+        ]
+      }
+    ]);
+    expect(fromParts).toMatchObject({
+      inputTokens: 1000,
+      cacheReadTokens: 900,
+      cacheWriteTokens: 0,
+      latestHitRate: 0.9,
+      hitRate: 0.9,
+      hitRateRequestCount: 1,
+      totalInputTokens: 1000,
+      totalCacheReadTokens: 900
+    });
+    expect(context.project({
+      messages: [{
+        info: { role: "assistant", tokens: undefined },
+        parts: [{ type: "step-finish", tokens: { input: 1000, cache: { read: 900, write: 0 } } }]
+      }],
+      projection: { contextUsed: 1000, contextWindow: 100_000 }
+    })).toMatchObject({
+      used: 1000,
+      size: 100_000,
+      cache: {
+        inputTokens: 1000,
+        cacheReadTokens: 900,
+        latestHitRate: 0.9
+      }
+    });
+
+    // Message tokens win over parts; parts only fill the gap.
+    const preferMessage = aggregate([
+      {
+        info: { role: "assistant", tokens: { input: 500, cache: { read: 500, write: 10 } } },
+        parts: [{ type: "step-finish", tokens: { input: 999, cache: { read: 1, write: 0 } } }]
+      }
+    ]);
+    expect(preferMessage).toMatchObject({ totalInputTokens: 500, totalCacheReadTokens: 500, totalCacheWriteTokens: 10 });
+
+    // Non-assistant and summary messages are ignored as before.
+    expect(aggregate([
+      { info: { role: "user" }, parts: [{ type: "step-finish", tokens: { input: 10, cache: { read: 1 } } }] },
+      { info: { role: "assistant", summary: "compact" }, parts: [{ type: "step-finish", tokens: { input: 10, cache: { read: 1 } } }] }
+    ])).toBeUndefined();
+  });
+
+  test("detects a partially applied context-cache patch instead of silently skipping t5e", () => {
+    // Simulate a runtime where oSi is patched ($ctxCache present) but t5e is not.
+    // Before the fix, the $ctxCache gate caused the whole block to skip, so t5e's
+    // stale `t?.used===contextUsed?t.cache:void 0` would silently survive.
+    const fullyPatched = patchRuntimeContextCacheFromParts([
+      'function YRe(e){return typeof e=="number"&&Number.isInteger(e)&&e>=0?e:void 0}',
+      'function Loe(e){return typeof e=="number"&&Number.isInteger(e)&&e>0?e:void 0}',
+      'function Xki(e,t){return e}',
+      'function eSi(e){return}',
+      'function oSi(e,t){if(t<=0)return;let r=aSi(e);for(let n=e.length-1;n>=0;n-=1){let o=e[n];if(!o)continue;if(o.info.role==="user"&&o.info.summary){let a=o.parts.find(u=>u.type==="compaction"&&u.compactBoundary);if(a?.type==="compaction"&&a.compactBoundary){let u=Loe(a.compactBoundary.truePostCompactTokenCount??a.compactBoundary.postCompactTokenCount);if(u!==void 0)return{cost:null,size:t,used:u}}}if(o.info.role!=="assistant"||o.info.summary)continue;let i=iSi(o.info.tokens);if(i!==void 0)return{...r?{cache:r}:{},cost:null,size:t,used:i}}}',
+      'function nSi(e,t){if(!(e.contextUsed<=0||e.contextWindow<=0))return{...t?{cache:t}:{},cost:null,size:e.contextWindow,used:e.contextUsed}}',
+      'function aSi(e){let t=0,r=0,n=0,o=0,i=0,a=0,u=0;for(let l of e){if(l.info.role!=="assistant"||l.info.summary)continue;let c=YRe(l.info.tokens.input)??0,d=YRe(l.info.tokens.cache.read)??0,p=YRe(l.info.tokens.cache.write)??0;c<=0&&d<=0&&p<=0||(o+=1,t+=c,r+=d,n+=p,i=c,a=d,u=p)}if(!(o<=0))return{inputTokens:i,cacheReadTokens:a,cacheWriteTokens:u,latestHitRate:i>0?a/i:null,hitRate:t>0?r/t:null,hitRateRequestCount:o,totalInputTokens:t,totalCacheReadTokens:r,totalCacheWriteTokens:n}}',
+      'function iSi(e){if(!e)return;let t=Loe(e.total);if(t!==void 0)return t;let r=Loe(e.input);if(r!==void 0)return r+(YRe(e.output)??0)}',
+      'function t5e(e){let t=oSi(e.messages,e.projection.contextWindow);return Xki(nSi(e.projection,t?.used===e.projection.contextUsed?t.cache:void 0)??t,eSi(e.persistedContextUsageBreakdownEvents??[]))}'
+    ].join(""));
+    expect(fullyPatched).toContain("nSi(e.projection,t?.cache)??t");
+
+    // Roll back ONLY the t5e patch (revert to the stale caller) while keeping oSi.
+    const partial = fullyPatched.replace(
+      "nSi(e.projection,t?.cache)??t",
+      "nSi(e.projection,t?.used===e.projection.contextUsed?t.cache:void 0)??t"
+    );
+    expect(partial).not.toContain("nSi(e.projection,t?.cache)??t");
+    // Re-applying must detect and fix the missing t5e patch — not silently skip it.
+    const repaired = patchRuntimeContextCacheFromParts(partial);
+    expect(repaired).toContain("nSi(e.projection,t?.cache)??t");
+    expect(repaired).not.toContain("t?.used===e.projection.contextUsed?t.cache:void 0");
+    // Idempotence on the fully-patched runtime is preserved.
+    expect(patchRuntimeContextCacheFromParts(fullyPatched)).toBe(fullyPatched);
+  });
+
+
   test("applies required patches and records optional compatibility skips", () => {
     const result = applyRuntimePatchPlan("runtime", [
       {
@@ -505,6 +895,24 @@ describe("runtime synchronization", () => {
     expect(parseRuntimePatchReports(result.reports)).toEqual(result.reports);
     expect(parseRuntimePatchReports([{ ...result.reports[0], status: "unknown" }])).toBeUndefined();
   });
+
+  test("keeps atebites Advisor, attestation, and ODW patches in the default runtime plan", () => {
+    const ids = runtimePatchPlan.map((patch) => patch.id);
+    expect(ids.indexOf("tui-bridge")).toBeLessThan(ids.indexOf("usage-footer"));
+    expect(ids.indexOf("usage-footer")).toBeLessThan(ids.indexOf("runtime-attestation"));
+    expect(ids.indexOf("login-model-defaults")).toBeLessThan(ids.indexOf("route-selection"));
+    expect(runtimePatchPlan.find((patch) => patch.id === "context-cache-from-parts")?.requirement)
+      .toBe("optional");
+    for (const id of [
+      "usage-footer",
+      "route-selection",
+      "runtime-attestation",
+      "strict-advisor-hooks"
+    ]) {
+      expect(runtimePatchPlan.find((patch) => patch.id === id)?.requirement).toBe("required");
+    }
+  });
+
 
   test("formats and writes actionable compatibility reports for CI and issue updates", async () => {
     const report = {
@@ -1417,5 +1825,136 @@ describe("runtime synchronization", () => {
     expect(statuses).toEqual(["paused"]);
     expect(patchRuntimeGoalFailurePause(patched)).toBe(patched);
     expect(() => patchRuntimeGoalFailurePause("incompatible runtime")).toThrow(/incompatible/);
+  });
+
+  test("injects a zcode_usage footer into the runPrompt non-JSON exit under ODW protocol", () => {
+    // Hand-built fixture mirroring the real runPrompt exit: the JSON branch writes projection
+    // totals, then the non-JSON branch writes `${W.response}\n`. The app var `f` (with .sessionId)
+    // is referenced earlier in the JSON branch as `sessionId:f.sessionId,traceId`.
+    // 手搓 fixture，镜像真实的 runPrompt 退出：JSON 分支写出 projection 总数，非 JSON 分支写出
+    // `${W.response}\n`。app 变量 `f`（带 .sessionId）在更早的 JSON 分支里以
+    // `sessionId:f.sessionId,traceId` 形式被引用。
+    const runtime = [
+      "let f=makeApp();let W=await f.submitPrompt(p,{abortSignal:y.signal});",
+      "return m=W.traceId??m,o.json?(e.stdout.write(Sl({sessionId:f.sessionId,traceId:m,",
+      "response:W.response,...W.usage?{usage:{...W.usage}}:{},eventCount:W.events.length,",
+      "projection:{status:W.projection.status,turnCount:W.projection.turnCount,",
+      "totalTokenCount:W.projection.totalTokenCount,contextUsed:W.projection.contextUsed??null,",
+      "contextWindow:W.projection.contextWindow??null}})),0):(e.stdout.write(`${W.response}\n`),0)}catch(k){"
+    ].join("");
+
+    const patched = patchRuntimeUsageFooter(runtime);
+
+    // The footer write is gated on ZCODE_ODW_PROTOCOL and carries sessionId + token fields. We
+    // match unambiguous substrings (the injected JSON uses escaped quotes whose exact escaping
+    // level is fiddly to spell in a TS string literal).
+    // footer 写出以 ZCODE_ODW_PROTOCOL 收口，携带 sessionId + token 字段。这里匹配无歧义的子串
+    // （注入的 JSON 用转义引号，其确切转义层数在 TS 字符串字面量里写起来很绕）。
+    expect(patched).toContain("zcode_usage");
+    expect(patched).toContain("ZCODE_ODW_PROTOCOL");
+    expect(patched).toContain("sessionId:f.sessionId");
+    expect(patched).toContain("totalTokens:W.projection.totalTokenCount");
+    expect(patched).toContain("inputTokens:W.usage.inputTokens");
+    expect(patched).toContain("outputTokens:W.usage.outputTokens");
+    // The original response write is preserved (still emits the agent text to stdout), and the
+    // footer goes to stderr so the launcher can strip+parse it without polluting the agent text.
+    // 原始的 response 写出保留（仍向 stdout 输出 agent 文本），footer 走 stderr，让 launcher 能
+    // 剥离+解析而不污染 agent 文本。
+    expect(patched).toContain("e.stdout.write(`${W.response}");
+    expect(patched).toContain("e.stderr.write(JSON.stringify(");
+  });
+
+  test("patchRuntimeUsageFooter is idempotent and throws on an incompatible runtime", () => {
+    // The full contiguous anchor the regex requires (projection totals → non-JSON stdout write),
+    // preceded by a sessionId reference so the app-var discovery succeeds.
+    // 正则所需的完整连续锚点（projection 总数 → 非 JSON stdout 写出），前置一个 sessionId 引用
+    // 使 app 变量发现成功。
+    const runtime = [
+      "let f=makeApp();let W=await f.submitPrompt(p,{abortSignal:y.signal});",
+      "o.json?(e.stdout.write(Sl({sessionId:f.sessionId,traceId:m,totalTokenCount:W.projection.totalTokenCount,contextUsed:W.projection.contextUsed??null,contextWindow:W.projection.contextWindow??null}})),0):(e.stdout.write(`${W.response}\n`),0)}catch(k){"
+    ].join("");
+    const patched = patchRuntimeUsageFooter(runtime);
+    expect(patchRuntimeUsageFooter(patched)).toBe(patched);
+    expect(() => patchRuntimeUsageFooter("incompatible runtime with no runPrompt exit")).toThrow(
+      /runPrompt non-JSON exit anchor missing/
+    );
+  });
+
+  test("accepts the 3.8.1 workspace-hook diagnostic before the non-JSON exit", () => {
+    const runtime = [
+      "let f=makeApp();let H=await f.submitPrompt(p,{abortSignal:y.signal});",
+      "o.json?(e.stdout.write(Sl({sessionId:f.sessionId,traceId:m,totalTokenCount:H.projection.totalTokenCount,",
+      "contextUsed:H.projection.contextUsed??null,contextWindow:H.projection.contextWindow??null}})),0):",
+      "(J&&Q4i(e,J),e.stdout.write(`${H.response}\n`),0)}catch(I){"
+    ].join("");
+    const patched = patchRuntimeUsageFooter(runtime);
+    expect(patched).toContain("J&&Q4i(e,J),e.stdout.write(`${H.response}");
+    expect(patched.split("zcode_usage").length - 1).toBe(2);
+    expect(patchRuntimeUsageFooter(patched)).toBe(patched);
+  });
+
+  test("discovers an alternate 3.8.1 workspace-hook writer name", () => {
+    const runtime = [
+      "let f=makeApp();let H=await f.submitPrompt(p,{abortSignal:y.signal});",
+      "o.json?(e.stdout.write(Sl({sessionId:f.sessionId,traceId:m,totalTokenCount:H.projection.totalTokenCount,",
+      "contextUsed:H.projection.contextUsed??null,contextWindow:H.projection.contextWindow??null}})),0):",
+      "(J&&W4i(e,J),e.stdout.write(`${H.response}\n`),0)}catch(I){"
+    ].join("");
+    const patched = patchRuntimeUsageFooter(runtime);
+    expect(patched).toContain("J&&W4i(e,J),e.stdout.write(`${H.response}");
+    expect(patched.split("zcode_usage").length - 1).toBe(2);
+    expect(patchRuntimeUsageFooter(patched)).toBe(patched);
+  });
+
+  test("rejects a workspace-hook diagnostic on a different stream", () => {
+    const runtime = [
+      "let f=makeApp();let H=await f.submitPrompt(p,{abortSignal:y.signal});",
+      "o.json?(e.stdout.write(Sl({sessionId:f.sessionId,traceId:m,totalTokenCount:H.projection.totalTokenCount,",
+      "contextUsed:H.projection.contextUsed??null,contextWindow:H.projection.contextWindow??null}})),0):",
+      "(J&&Q4i(d,J),e.stdout.write(`${H.response}\n`),0)}catch(I){"
+    ].join("");
+    expect(() => patchRuntimeUsageFooter(runtime)).toThrow(
+      /workspace-hook diagnostic stream mismatch/
+    );
+  });
+
+  test("Bug F: also patches the --json exit branch so telemetry isn't lost under --json", () => {
+    // Fixture with BOTH branches: the JSON branch writes Sl({...contextWindow…}})),0) to stdout,
+    // then the ternary splits to the non-JSON stdout.write. The patch must inject the footer at
+    // BOTH exits (two zcode_usage sites) so a caller using `--json` under ZCODE_ODW_PROTOCOL also
+    // gets telemetry. The anchors overlap (the non-JSON regex starts inside the JSON branch's
+    // contextWindow tail), so this also covers the right-to-left index application.
+    // 含【两个】分支的 fixture：JSON 分支把 Sl({...contextWindow…}})),0) 写到 stdout，随后三元分流到
+    // 非 JSON 的 stdout.write。补丁必须在【两处】出口都注入 footer（两个 zcode_usage 位点），这样在
+    // ZCODE_ODW_PROTOCOL 下用 `--json` 的调用方也能拿到遥测。两锚点重叠（非 JSON 正则起点位于 JSON
+    // 分支的 contextWindow 尾部之内），故这也覆盖了从右到左的下标应用。
+    const runtime = [
+      "let f=makeApp();let W=await f.submitPrompt(p,{abortSignal:y.signal});",
+      "o.json?(e.stdout.write(Sl({sessionId:f.sessionId,traceId:m,totalTokenCount:W.projection.totalTokenCount,",
+      "contextUsed:W.projection.contextUsed??null,contextWindow:W.projection.contextWindow??null}})),0):",
+      "(e.stdout.write(`${W.response}\n`),0)}catch(k){after"
+    ].join("");
+    const patched = patchRuntimeUsageFooter(runtime);
+    const sites = patched.split("zcode_usage").length - 1;
+    expect(sites).toBe(2);
+    expect(patchRuntimeUsageFooter(patched)).toBe(patched);
+  });
+
+  test("injects usage footers into the 3.10.2 JSON.stringify, formatted, and plain exits", () => {
+    const runtime = [
+      "let _=makeApp();let Q=await _.submitPrompt(p,{abortSignal:y.signal});",
+      'return D?(e.stdout.write(`${JSON.stringify({type:"result",sessionId:_.sessionId,traceId:h,',
+      "response:Q.response,projection:{status:Q.projection.status,turnCount:Q.projection.turnCount,",
+      "totalTokenCount:Q.projection.totalTokenCount,contextUsed:Q.projection.contextUsed??null,",
+      "contextWindow:Q.projection.contextWindow??null}})}\n`),0):mhn(n)?(e.stdout.write(pc({sessionId:_.sessionId,traceId:h,",
+      "response:Q.response,projection:{status:Q.projection.status,turnCount:Q.projection.turnCount,",
+      "totalTokenCount:Q.projection.totalTokenCount,contextUsed:Q.projection.contextUsed??null,",
+      "contextWindow:Q.projection.contextWindow??null}})),0):(X&&lFi(e,X),e.stdout.write(`${Q.response}\n`),0)}catch(I){"
+    ].join("");
+    const patched = patchRuntimeUsageFooter(runtime);
+    expect(patched.split("zcode_usage").length - 1).toBe(3);
+    expect(patched).toContain("e.stdout.write(`${Q.response}");
+    expect(patched).toContain("(X&&lFi(e,X),e.stdout.write(`${Q.response}");
+    expect(patchRuntimeUsageFooter(patched)).toBe(patched);
   });
 });

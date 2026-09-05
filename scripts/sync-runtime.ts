@@ -856,6 +856,170 @@ export function patchRuntimeTuiBridge(runtime: string): string {
   return patched;
 }
 
+/**
+ * Inject a token-usage footer into the headless `runPrompt` exit path so ODW (and any
+ * ZCODE_ODW_PROTOCOL=1 caller) can recover token telemetry from the otherwise-opaque
+ * single-envelope run. The launcher captures stdout as the agent text and historically
+ * hardcodes all telemetry to null — the runtime has the data (sessionId + per-turn usage
+ * + a projection token total) but never emits it in prompt mode. This patch makes the
+ * non-JSON prompt exit ALSO write a structured `{"type":"zcode_usage",...}` line to
+ * stderr when ZCODE_ODW_PROTOCOL=1; the launcher strips + parses it and fills the
+ * envelope. Gated on the env var so normal `zcode --prompt` output is unchanged.
+ *
+ * Anchor: the `runPrompt` non-JSON branch — `:(<streams>.stdout.write(`<result>\n`),0)}catch(<e>)`
+ * — where <streams>, <result>, <catchvar> are minified names captured from the pattern itself
+ * (same variable-name-discovery technique as patchRuntimeTuiBridge). The result object carries
+ * `.usage` (per-turn) and `.projection.totalTokenCount`; the app object carries `.sessionId`.
+ *
+ * 在 headless `runPrompt` 的退出路径上注入一条 token-usage 尾行，使 ODW（以及任何
+ * ZCODE_ODW_PROTOCOL=1 的调用方）能从原本不透明的单信封运行中取回 token 遥测。launcher 把
+ * stdout 当作 agent 文本捕获，历史上把所有遥测硬编码为 null —— 运行时有数据（sessionId + 单轮
+ * usage + projection 的 token 总数），但 prompt 模式从不输出。本补丁让非 JSON 的 prompt 退出在
+ * ZCODE_ODW_PROTOCOL=1 时【额外】向 stderr 写一行结构化的 `{"type":"zcode_usage",...}`；launcher
+ * 将其剥离并解析、填入信封。以环境变量收口，正常的 `zcode --prompt` 输出不变。
+ *
+ * 锚点：`runPrompt` 的非 JSON 分支 —— `:(<streams>.stdout.write(`<result>\n`),0)}catch(<e>)`
+ * —— 其中 <streams>、<result>、<catchvar> 是从模式本身捕获的压缩名（与 patchRuntimeTuiBridge
+ * 同样的变量名发现技术）。result 对象带 `.usage`（单轮）与 `.projection.totalTokenCount`；
+ * app 对象带 `.sessionId`。
+ */
+export function patchRuntimeUsageFooter(runtime: string): string {
+  // Idempotency: the injected footer writes `JSON.stringify({type:"zcode_usage",...})` to stderr.
+  // In the bundled source that appears with escaped quotes ({type:\"zcode_usage\"}), so match the
+  // stable unescaped substring `zcode_usage` (it does not occur in the upstream runtime).
+  // 幂等性：注入的 footer 向 stderr 写 `JSON.stringify({type:"zcode_usage",...})`。在 bundle 源码
+  // 里它带转义引号（{type:\"zcode_usage\"}），故匹配稳定且未转义的子串 `zcode_usage`
+  //（上游 runtime 中不出现该串）。
+  if (runtime.includes("zcode_usage")) return runtime;
+
+  // Anchor on the projection totalTokenCount write (JSON branch) through the non-JSON stdout
+  // write, capturing the streams object, the result object, and the app object. The
+  // `totalTokenCount:<app>.projection.totalTokenCount` pin identifies the JSON branch of the
+  // runPrompt result; the following `:(<streams>.stdout.write(`<result>\n`),0)}catch(<e>)` is the
+  // non-JSON branch we patch.
+  // 以 JSON 分支的 projection totalTokenCount 写出为锚（跨到非 JSON 的 stdout 写出），捕获
+  // streams 对象、result 对象与 app 对象。`totalTokenCount:<app>.projection.totalTokenCount` 钉住
+  // runPrompt 结果的 JSON 分支；其后的 `:(<streams>.stdout.write(`<result>\n`),0)}catch(<e>)`
+  // 即为我们要打补丁的非 JSON 分支。
+  // ZCode 3.8.1 may prefix that branch with the exact workspace-hook diagnostic
+  // `<diagnostic>&&<writer>(<stream>,<diagnostic>),`; the writer is discovered and the
+  // captured diagnostic stream is checked against stdout below.
+  const exitPattern =
+    /totalTokenCount:([A-Za-z_$][\w$]*)\.projection\.totalTokenCount,contextUsed:\1\.projection\.contextUsed\?\?null,contextWindow:\1\.projection\.contextWindow\?\?null\}\}\)\),0\):\((?:([A-Za-z_$][\w$]*)&&([A-Za-z_$][\w$]*)\(([A-Za-z_$][\w$]*),\2\),)?([A-Za-z_$][\w$]*)\.stdout\.write\(`\$\{\1\.response\}\n`\),0\)\}catch\(([A-Za-z_$][\w$]*)\)/u;
+  const exit = exitPattern.exec(runtime);
+  if (!exit) {
+    throw new Error("ZCode runtime is incompatible with the usage-footer patch (runPrompt non-JSON exit anchor missing).");
+  }
+  const [match, resultVar, , , diagnosticStreamsVar, streamsVar] = exit;
+  if (diagnosticStreamsVar !== undefined && diagnosticStreamsVar !== streamsVar) {
+    throw new Error("ZCode runtime is incompatible with the usage-footer patch (workspace-hook diagnostic stream mismatch).");
+  }
+  // Discover the app object (the one with .sessionId) by looking back from the exit for the
+  // `sessionId:<app>.sessionId,traceId` reference that appears in the JSON branch just above.
+  // 从退出点向前回查 `sessionId:<app>.sessionId,traceId`（出现在上方的 JSON 分支里）以发现
+  // app 对象（带 .sessionId 的那个）。
+  const sessionIdRefPattern = new RegExp(`sessionId:([A-Za-z_$][\\w$]*)\\.sessionId,traceId`, "gu");
+  let appVar: string | undefined;
+  let searchFrom = exit.index;
+  // Search backwards in chunks for the sessionId reference that precedes the exit.
+  // 向前分块搜索位于退出点之前的 sessionId 引用。
+  while (searchFrom > 0) {
+    const chunkStart = Math.max(0, searchFrom - 4000);
+    const chunk = runtime.slice(chunkStart, exit.index);
+    const refs = [...chunk.matchAll(sessionIdRefPattern)];
+    if (refs.length > 0) {
+      appVar = refs[refs.length - 1][1];
+      break;
+    }
+    searchFrom = chunkStart;
+  }
+  if (!appVar) {
+    throw new Error("ZCode runtime is incompatible with the usage-footer patch (runPrompt app/sessionId anchor missing).");
+  }
+
+  // Build the footer-write expression, gated on ZCODE_ODW_PROTOCOL. It runs as a third element of
+  // the comma sequence `(stdout.write(...), <footer>, 0)` so the function still returns 0. The
+  // footer carries sessionId, the per-turn input/output (from usage if present), and the
+  // projection total. All fields are optional on the launcher side. The footer string ends with a
+  // literal newline: the generated source contains +"\\n" (backslash-n) so the runtime evaluates
+  // "\n" to a real newline on stderr, and the launcher can split stderr lines to find it.
+  // 构造 footer 写出表达式，以 ZCODE_ODW_PROTOCOL 收口。它作为逗号序列的第三项
+  // `(stdout.write(...), <footer>, 0)` 执行，函数仍返回 0。footer 携带 sessionId、单轮
+  // input/output（若有 usage 则取自 usage）以及 projection 总数。所有字段在 launcher 侧都是可选的。
+  // footer 串以字面换行结尾：生成的源码里是 +"\\n"（反斜杠 n），使运行时把 "\n" 求值为真实换行
+  // 输出到 stderr，launcher 据此按行切分 stderr 即可找到它。
+  const footerWrite =
+    `(process.env.ZCODE_ODW_PROTOCOL==="1"&&${streamsVar}.stderr.write(JSON.stringify({type:"zcode_usage",sessionId:${appVar}.sessionId,` +
+    `totalTokens:${resultVar}.projection.totalTokenCount,` +
+    `...${resultVar}.usage?{inputTokens:${resultVar}.usage.inputTokens,outputTokens:${resultVar}.usage.outputTokens}:{}})+"\\n"))`;
+  // Insert the footer into the matched comma sequence. The full match spans
+  // `(STREAMS.stdout.write(…),0)}catch(VAR)` — i.e. it includes the trailing catch clause. We
+  // locate the `),0)` that closes the stdout.write comma-sequence, splice the footer before that
+  // final `0`, and KEEP everything after `),0)` (the `}catch(VAR)`) intact. Working from the regex
+  // match (not re-searching with a second regex) avoids any newline-vs-backslash-n ambiguity in
+  // the original template literal.
+  // 把 footer 插入匹配到的逗号序列。完整匹配跨越 `(STREAMS.stdout.write(…),0)}catch(VAR)`
+  // —— 即它包含尾部的 catch 子句。我们定位结束 stdout.write 逗号序列的 `),0)`，把 footer 拼在
+  // 最后那个 `0` 之前，并【保留】 `),0)` 之后的所有内容（`}catch(VAR)`）。基于正则匹配结果操作
+  //（而非用第二条正则再搜），可避免原模板字面量里「真实换行 vs 反斜杠 n」的歧义。
+  // Both exit branches (JSON and non-JSON) need the footer. Their anchors OVERLAP — the non-JSON
+  // regex `match` begins inside the JSON branch's `…contextWindow:…??null}})),0)` text — so neither
+  // string-replace-first nor regex-replace-first works cleanly (each would consume or shift the
+  // other's anchor). Instead we compute BOTH edits as absolute index ranges in the ORIGINAL runtime
+  // and apply them right-to-left (later index first) so earlier indices stay valid. The two ranges
+  // are disjoint in what they REPLACE: the JSON edit inserts at the `,0)` of the JSON branch; the
+  // non-JSON edit replaces the non-JSON branch's `(stdout.write(…),0)}catch(VAR)`.
+  // 两个退出分支（JSON 与非 JSON）都需要 footer。它们的锚点【重叠】——非 JSON 正则 match 起点位于
+  // JSON 分支的 `…contextWindow:…??null}})),0)` 文本内部——所以「先 replace 字符串」或「先 replace
+  // 正则」都不干净（各自会吃掉或挪动对方的锚点）。改为：把两处编辑都算成原始 runtime 里的绝对
+  // 下标区间，然后【从右到左】应用（先做下标靠后的），使靠前的下标保持有效。两处区间在「被替换
+  // 内容」上是互不相交的：JSON 编辑在 JSON 分支的 `,0)` 处插入；非 JSON 编辑替换非 JSON 分支的
+  // `(stdout.write(…),0)}catch(VAR)`。
+  const tail = `),0)`;
+  const tailIdx = match.lastIndexOf(tail);
+  if (tailIdx < 0) {
+    throw new Error("ZCode runtime is incompatible with the usage-footer patch (runPrompt exit comma-tail missing).");
+  }
+  // Non-JSON edit: absolute range [matchStart + tailIdx, matchStart + tailIdx + tail.length) → footer.
+  // 非 JSON 编辑：绝对区间 [matchStart + tailIdx, matchStart + tailIdx + tail.length) → footer。
+  const nonJsonStart = exit.index + tailIdx;
+  const nonJsonReplacement = `),${footerWrite},0)`;
+
+  // Structured-output edits: insert the footer before each projection-bearing `,0)` exit. 3.8.1
+  // wrote `Sl({...??null}})),0)`; 3.10.2 kept that shape for the formatted (`pc`) branch and
+  // added a JSON.stringify template branch that ends `...??null}})}\n`),0)`.
+  // 结构化输出编辑：在每个带 projection 的 `,0)` 出口前插入 footer。3.8.1 写
+  // `Sl({...??null}})),0)`；3.10.2 把该形态留给 formatted（`pc`）分支，并新增以
+  // `...??null}})}\n`),0)` 结尾的 JSON.stringify 模板分支。
+  const jsonInsertion = `,${footerWrite}`;
+  const jsonTails = [
+    `contextWindow:${resultVar}.projection.contextWindow??null}})),0)`,
+    `contextWindow:${resultVar}.projection.contextWindow??null}})}\n` + "`),0)"
+  ];
+  const edits: Array<{ start: number; end: number; text: string }> = [
+    { start: nonJsonStart, end: nonJsonStart + tail.length, text: nonJsonReplacement }
+  ];
+  for (const needle of jsonTails) {
+    let from = 0;
+    while (from < runtime.length) {
+      const idx = runtime.indexOf(needle, from);
+      if (idx < 0) break;
+      const insertAt = idx + needle.length - 3;
+      if (insertAt !== nonJsonStart) {
+        edits.push({ start: insertAt, end: insertAt, text: jsonInsertion });
+      }
+      from = idx + needle.length;
+    }
+  }
+  edits.sort((left, right) => right.start - left.start);
+
+  let patched = runtime;
+  for (const edit of edits) {
+    patched = patched.slice(0, edit.start) + edit.text + patched.slice(edit.end);
+  }
+  return patched;
+}
+
 export function patchRuntimeOAuthHttpErrors(runtime: string): string {
   if (runtime.includes("empty or non-JSON response")) return runtime;
   if (!runtime.includes('"OAuth response is not valid JSON",{httpStatus:void 0}')) return runtime;
@@ -1223,6 +1387,12 @@ export const runtimePatchPlan: readonly RuntimePatchDefinition[] = [
       && runtime.includes(".loadSessionContextMessages=async()=>await(await")
   },
   {
+    id: "usage-footer",
+    requirement: "required",
+    apply: patchRuntimeUsageFooter,
+    verify: (runtime) => runtime.includes("zcode_usage")
+  },
+  {
     id: "goal-failure-pause",
     requirement: "optional",
     apply: patchRuntimeGoalFailurePause,
@@ -1278,6 +1448,40 @@ export const runtimePatchPlan: readonly RuntimePatchDefinition[] = [
     apply: patchRuntimeLoginModelDefaults
   },
   {
+    // 3.8.1 minified aggregator/projection names (`aSi`/`oSi`/`nSi`) moved again in 3.10.2.
+    // The original token-write bug is already fixed upstream; skip rather than fail the sync.
+    id: "context-cache-from-parts",
+    requirement: "optional",
+    apply: patchRuntimeContextCacheFromParts,
+    verify: (runtime) => runtime.includes("$ctxPartTokens")
+      && runtime.includes("nSi(e.projection,t?.cache)??t")
+  },
+  {
+    id: "route-selection",
+    requirement: "required",
+    apply: patchRuntimeRouteSelection,
+    verify: (runtime) => runtime.includes("function __zcodeResolveAdvisorRolePolicy")
+      && runtime.includes("ZCODE_RUNTIME_ROUTE_UNSUPPORTED_THOUGHT_LEVEL")
+      && runtime.includes('__zcodeRoutePolicySource:"parent"')
+  },
+  {
+    id: "runtime-attestation",
+    requirement: "required",
+    apply: patchRuntimeAttestation,
+    verify: (runtime) => runtime.includes("function __zcodeRuntimeAttestation")
+      && runtime.includes("ZCODE_ODW_RUNTIME_ATTESTATION")
+      && runtime.includes('type:"zcode_runtime_attestation"')
+  },
+  {
+    id: "strict-advisor-hooks",
+    requirement: "required",
+    apply: patchRuntimeStrictAdvisorHooks,
+    verify: (runtime) => runtime.includes("function __zcodeIsStrictAdvisorHook")
+      && runtime.includes("function __zcodeStrictAdvisorHookFailureMessage")
+      && runtime.includes("ZCODE_STRICT_ADVISOR_HOOK_FAILURE")
+      && runtime.includes("let _zcodeSendResult=await t.app.sendInput({attachments:")
+  },
+  {
     id: "cli-help-contract",
     requirement: "required",
     apply: patchRuntimeCliHelpContract,
@@ -1320,6 +1524,585 @@ export function applyRuntimePatchPlan(
     }
   }
   return { runtime: patched, reports };
+}
+
+/**
+ * Repair `/context` cache stats for historical sessions whose assistant messages
+ * carry zero tokens (pre-3.8.1 runtimes never persisted them on the main-turn path).
+ *
+ * The 3.8.1 runtime renamed the aggregator `mda`→`aSi`, the coercion helper
+ * `zRe`→`YRe`, and the projection `LRe`→`oSi`. The token-write bug itself is
+ * fixed at the source (the step-finish handler now calls `persistAssistantMessage`
+ * with `tokens:Tq(r.result.usage)`), so this patch only needs the read-path
+ * fallback: when an assistant message's `info.tokens` are all zero, fall back to
+ * the last `step-finish` part that carries positive token counts.
+ */
+export function patchRuntimeContextCacheFromParts(runtime: string): string {
+  const aggregateAnchor =
+    'function aSi(e){let t=0,r=0,n=0,o=0,i=0,a=0,u=0;for(let l of e){if(l.info.role!=="assistant"||l.info.summary)continue;let c=YRe(l.info.tokens.input)??0,d=YRe(l.info.tokens.cache.read)??0,p=YRe(l.info.tokens.cache.write)??0;c<=0&&d<=0&&p<=0||(o+=1,t+=c,r+=d,n+=p,i=c,a=d,u=p)}';
+  const projectionAnchor =
+    'function oSi(e,t){if(t<=0)return;let r=aSi(e);for(let n=e.length-1;n>=0;n-=1){let o=e[n];if(!o)continue;if(o.info.role==="user"&&o.info.summary){let a=o.parts.find(u=>u.type==="compaction"&&u.compactBoundary);if(a?.type==="compaction"&&a.compactBoundary){let u=Loe(a.compactBoundary.truePostCompactTokenCount??a.compactBoundary.postCompactTokenCount);if(u!==void 0)return{cost:null,size:t,used:u}}}if(o.info.role!=="assistant"||o.info.summary)continue;let i=iSi(o.info.tokens);if(i!==void 0)return{...r?{cache:r}:{},cost:null,size:t,used:i}}}';
+  const projectionCallerAnchor =
+    'function t5e(e){let t=oSi(e.messages,e.projection.contextWindow);return Xki(nSi(e.projection,t?.used===e.projection.contextUsed?t.cache:void 0)??t,eSi(e.persistedContextUsageBreakdownEvents??[]))}';
+  const projectionCallerMarker = "nSi(e.projection,t?.cache)??t";
+  let patched = runtime;
+  if (!patched.includes("$ctxPartTokens")) {
+    const anchorIndex = patched.indexOf(aggregateAnchor);
+    if (anchorIndex < 0) {
+      throw new Error("ZCode runtime is incompatible with the context-cache patch (aggregator anchor missing).");
+    }
+    const fallbackHelper = [
+      "let $ctxPartTokens=function(l){",
+      'let f=Array.isArray(l.parts)?l.parts.filter(function(x){return x&&x.type==="step-finish"&&x.tokens}):[];',
+      "for(let k=f.length-1;k>=0;k-=1){",
+      "let g=f[k].tokens||{},h=YRe(g.input)??0,y=YRe(g.cache&&g.cache.read)??0,w=YRe(g.cache&&g.cache.write)??0;",
+      "if(h>0||y>0||w>0)return{input:h,cache:{read:y,write:w}};}",
+      "return null};",
+      'let $ctxMsgTokens=function(l){let q=l.info.tokens;return q&&typeof q=="object"?{input:YRe(q.input)??0,cache:{read:YRe(q.cache&&q.cache.read)??0,write:YRe(q.cache&&q.cache.write)??0}}:{input:0,cache:{read:0,write:0}}};'
+    ].join("");
+    const replacement = `function aSi(e){${fallbackHelper}let t=0,r=0,n=0,o=0,i=0,a=0,u=0;for(let l of e){if(l.info.role!=="assistant"||l.info.summary)continue;let v=$ctxPartTokens(l),m=$ctxMsgTokens(l);let c=m.input,d=m.cache.read,p=m.cache.write;if((c<=0&&d<=0&&p<=0)&&v){c=v.input;d=v.cache.read;p=v.cache.write}c<=0&&d<=0&&p<=0||(o+=1,t+=c,r+=d,n+=p,i=c,a=d,u=p)}`;
+    patched = patched.slice(0, anchorIndex) + replacement + patched.slice(anchorIndex + aggregateAnchor.length);
+  }
+  if (!patched.includes("$ctxCache")) {
+    if (!patched.includes(projectionAnchor)) {
+      throw new Error("ZCode runtime is incompatible with the context-cache patch (projection anchor missing).");
+    }
+    patched = patched.replace(
+      projectionAnchor,
+      'function oSi(e,t){if(t<=0)return;let $ctxCache=aSi(e);for(let n=e.length-1;n>=0;n-=1){let o=e[n];if(!o)continue;if(o.info.role==="user"&&o.info.summary){let a=o.parts.find(u=>u.type==="compaction"&&u.compactBoundary);if(a?.type==="compaction"&&a.compactBoundary){let u=Loe(a.compactBoundary.truePostCompactTokenCount??a.compactBoundary.postCompactTokenCount);if(u!==void 0)return{...$ctxCache?{cache:$ctxCache}:{},cost:null,size:t,used:u}}}if(o.info.role!=="assistant"||o.info.summary)continue;let i=iSi(o.info.tokens);if(i!==void 0)return{...$ctxCache?{cache:$ctxCache}:{},cost:null,size:t,used:i}}return $ctxCache?{...$ctxCache?{cache:$ctxCache}:{},cost:null,size:t,used:void 0}:void 0}'
+    );
+  }
+  // The projection caller (t5e) has its own marker so a partial application
+  // (oSi patched but t5e not) is still detected instead of silently skipped.
+  if (!patched.includes(projectionCallerMarker)) {
+    if (!patched.includes(projectionCallerAnchor)) {
+      throw new Error("ZCode runtime is incompatible with the context-cache patch (projection caller anchor missing).");
+    }
+    patched = patched.replace(
+      projectionCallerAnchor,
+      'function t5e(e){let t=oSi(e.messages,e.projection.contextWindow);return Xki(nSi(e.projection,t?.cache)??t,eSi(e.persistedContextUsageBreakdownEvents??[]))}'
+    );
+  }
+  return patched;
+}
+
+/** Apply exact main/lite reasoning levels and persist immutable Advisor role routing. */
+export function patchRuntimeRouteSelection(runtime: string): string {
+  const marker = "function __zcodeResolveAdvisorRolePolicy";
+  const requiredMarkers = [
+    marker,
+    "ZCODE_RUNTIME_ROUTE_UNSUPPORTED_THOUGHT_LEVEL",
+    "__zcodeRolePolicy",
+    'n.startsWith("sol-advisor@")',
+    "this.sessionPersisted=!0;let __zcodePersistPolicy=this.config.__zcodeRolePolicy",
+    "hooks:this.config.hooks",
+    '__zcodeRoutePolicySource:"parent"'
+  ];
+  if (runtime.includes(marker)) {
+    if (requiredMarkers.every((value) => runtime.includes(value))) return runtime;
+    throw new Error("ZCode runtime has a partial runtime route patch.");
+  }
+
+  const ident = "([A-Za-z_$][\\w$]*)";
+  const matchOnce = (name: string, pattern: RegExp): RegExpExecArray => {
+    const match = pattern.exec(runtime);
+    if (!match) {
+      throw new Error(`ZCode runtime is incompatible with the runtime route patch (${name} anchor count 0).`);
+    }
+    return match;
+  };
+
+  const configKeys = matchOnce(
+    "config keys",
+    new RegExp(`${ident}=\\{ModelMain:"model.main",ModelLite:"model.lite",ModelAvailable:`, "u")
+  );
+  const configKeysVar = configKeys[1]!;
+  const parseModel = matchOnce(
+    "model ref parser",
+    /function ([A-Za-z_$][\w$]*)\(e\)\{if\(typeof e=="string"\)try\{let t=([A-Za-z_$][\w$]*)\(e\);return\{provider:t.providerId,model:t.modelId\}/u
+  );
+  const parseModelRef = parseModel[2]!;
+  const catalogLevels = matchOnce(
+    "catalog thought levels",
+    /strictPreferredThoughtLevel&&i&&!([A-Za-z_$][\w$]*)\(t,r\)\.includes\(i\)/u
+  );
+  const catalogLevelsFn = catalogLevels[1]!;
+  const bootstrap = matchOnce(
+    "main and lite selection",
+    new RegExp(
+      `_=n.bootstrapModelConfig\\?\\?\\(n.modelAdapter\\?r.config.model:${ident}\\(r\\)\\),`
+      + `y=n.runtimeConfig\\?\\.modelRef\\?\\?\\(_\\?${ident}\\(_\\):void 0\\),`
+      + `v=n.runtimeConfig\\?\\.modelProviderOptions,`
+      + `x=v\\?${ident}\\(y,v,r.config.modelCatalog\\):${ident}\\(_,y,r.config.modelCatalog,i\\),`
+      + `w=_\\?\\.lite\\?${ident}\\(_\\):void 0,`
+      + `b=n.runtimeConfig\\?\\.liteModelRef\\?\\?w,`
+      + `k=n.runtimeConfig\\?\\.liteModelProviderOptions\\?\\?\\(b\\?\\4\\(_,b,r.config.modelCatalog\\):void 0\\),S=`,
+      "u"
+    )
+  );
+  const readConfigModel = bootstrap[1]!;
+  const toModelRef = bootstrap[2]!;
+  const overlayProviderOptions = bootstrap[3]!;
+  const resolveProviderOptions = bootstrap[4]!;
+  const toLiteModelRef = bootstrap[5]!;
+  const runtimeConfigAssign = matchOnce(
+    "resolved main model",
+    /let ([A-Za-z_$][\w$]*)=\{\.\.\.n.runtimeConfig,bashTimeoutPolicy:/u
+  );
+  const persistFn = matchOnce(
+    "strict persistence availability",
+    /async function ([A-Za-z_$][\w$]*)\(e,t\)\{if\(!e.sessionStore.saveSessionEntry\)return;/u
+  );
+  const persistFnName = persistFn[1]!;
+  const persistFail = matchOnce(
+    "strict persistence failure",
+    /status:"failed",thoughtLevel:t\}\)\}\}function ([A-Za-z_$][\w$]*)/u
+  );
+  const sessionPersist = matchOnce(
+    "session route persistence",
+    /await ([A-Za-z_$][\w$]*)\(this,t\),this.sessionPersisted=!0,this.logger\?\.debug\("Session persisted"/u
+  );
+  const restoreCall = matchOnce(
+    "restore policy input",
+    /l&&\(u.model=l.model,u.thoughtLevel=l.thoughtLevel,u.thoughtSource="session_entry"\);let c=await ([A-Za-z_$][\w$]*)\(e,\{\.\.\.t,mode:u.mode,model:([A-Za-z_$][\w$]*)\(t.runtimeModel,u.model\),\.\.\.o.parentID\?\{parentSessionId:String\(o.parentID\)\}:\{\},workspace:i\}/u
+  );
+  const restoredAvailability = matchOnce(
+    "restored policy availability",
+    /([A-Za-z_$][\w$]*)=t.taskType\?\?"interactive",_=n&&!p&&!([A-Za-z_$][\w$]*)\(e,([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*)\),([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)\(t.mcpServers\);/u
+  );
+  const agentOptions = matchOnce(
+    "Agent route selection",
+    /([A-Za-z_$][\w$]*)=l\?l.modelProviderOptions:c\?void 0:([A-Za-z_$][\w$]*)\?([A-Za-z_$][\w$]*)\(e,i,t.profile\):u\?this.config.liteModelProviderOptions\?\?this.config.modelProviderOptions:this.config.modelProviderOptions,_=([A-Za-z_$][\w$]*)\(this,p\)/u
+  );
+  const subagentRole = matchOnce(
+    "Agent subagent role",
+    /modelRef:\{\.\.\.l.modelRef,role:([A-Za-z_$][\w$]*)\.Subagent\}/u
+  );
+  const childCtor = matchOnce(
+    "Agent child policy",
+    /let ([A-Za-z_$][\w$]*)=new ([A-Za-z_$][\w$]*)\(t.sessionId,\{mode:([A-Za-z_$][\w$]*),modelRef:p,/u
+  );
+  const childPersist = matchOnce(
+    "Agent child persistence",
+    /([A-Za-z_$][\w$]*)\?await ([A-Za-z_$][\w$]*)\.resumeFromStore\(\{traceContext:t.traceContext\}\):await \2.ensureSessionPersistedForExternalActivity\(t.prompt,\{traceContext:t.traceContext\}\),await ([A-Za-z_$][\w$]*)\(\),/u
+  );
+  const thoughtReader = matchOnce(
+    "persisted policy reader",
+    /let l=typeof i.thoughtLevel=="string"\?i.thoughtLevel.trim\(\):"";return\{model:\{modelId:([A-Za-z_$][\w$]*),providerId:([A-Za-z_$][\w$]*),\.\.\.l\?\{variant:l\}:\{\}\},\.\.\.l\?\{thoughtLevel:l\}:\{\}\}/u
+  );
+  const schema = matchOnce(
+    "model schema",
+    /=([A-Za-z_$][\w$]*)\.object\(\{main:([A-Za-z_$][\w$]*)\.optional\(\),lite:\2\.optional\(\)\}\)\.strict\(\)/u
+  );
+
+  let patched = runtime;
+  const replaceOnce = (name: string, anchor: string, replacement: string) => {
+    const count = patched.split(anchor).length - 1;
+    if (count !== 1) {
+      throw new Error(`ZCode runtime is incompatible with the runtime route patch (${name} anchor count ${count}).`);
+    }
+    patched = patched.split(anchor).join(replacement);
+  };
+
+  replaceOnce(
+    "config keys",
+    configKeys[0]!,
+    `${configKeysVar}={ModelMain:"model.main",ModelLite:"model.lite",ModelMainThoughtLevel:"model.mainThoughtLevel",ModelLiteThoughtLevel:"model.liteThoughtLevel",ModelAvailable:`
+  );
+  replaceOnce(
+    "config merge",
+    `t.model&&(t.model.main&&this.set(${configKeysVar}.ModelMain,t.model.main,r),t.model.lite&&this.set(${configKeysVar}.ModelLite,t.model.lite,r),t.model.available&&this.set(${configKeysVar}.ModelAvailable,t.model.available,r))`,
+    `t.model&&(t.model.main&&this.set(${configKeysVar}.ModelMain,t.model.main,r),t.model.lite&&this.set(${configKeysVar}.ModelLite,t.model.lite,r),t.model.mainThoughtLevel!==void 0&&this.set(${configKeysVar}.ModelMainThoughtLevel,t.model.mainThoughtLevel,r),t.model.liteThoughtLevel!==void 0&&this.set(${configKeysVar}.ModelLiteThoughtLevel,t.model.liteThoughtLevel,r),t.model.available&&this.set(${configKeysVar}.ModelAvailable,t.model.available,r))`
+  );
+  replaceOnce(
+    "config projection",
+    "model:t?{main:t,lite:r,available:n}:void 0,modelCatalog:",
+    `model:t?{main:t,lite:r,available:n,...this.store.get(${configKeysVar}.ModelMainThoughtLevel)!==void 0?{mainThoughtLevel:this.store.get(${configKeysVar}.ModelMainThoughtLevel)}:{},...this.store.get(${configKeysVar}.ModelLiteThoughtLevel)!==void 0?{liteThoughtLevel:this.store.get(${configKeysVar}.ModelLiteThoughtLevel)}:{}}:void 0,modelCatalog:`
+  );
+  replaceOnce(
+    "model schema",
+    schema[0]!,
+    `=${schema[1]}.object({main:${schema[2]}.optional(),lite:${schema[2]}.optional(),mainThoughtLevel:${schema[1]}.string().min(1).optional(),liteThoughtLevel:${schema[1]}.string().min(1).optional()}).strict()`
+  );
+  replaceOnce(
+    "model parser",
+    "return t&&(n.main=t),r&&(n.lite=r),Object.keys(n).length>0?n:void 0}",
+    "return t&&(n.main=t),r&&(n.lite=r),typeof e.mainThoughtLevel===\"string\"&&(n.mainThoughtLevel=e.mainThoughtLevel),typeof e.liteThoughtLevel===\"string\"&&(n.liteThoughtLevel=e.liteThoughtLevel),Object.keys(n).length>0?n:void 0}"
+  );
+  replaceOnce(
+    "model normalization",
+    "return r&&(i.main=r),n&&(i.lite=n),o.length>0&&(i.available=o),Object.keys(i).length>0?i:void 0}",
+    "return r&&(i.main=r),n&&(i.lite=n),t.mainThoughtLevel&&(i.mainThoughtLevel=t.mainThoughtLevel),t.liteThoughtLevel&&(i.liteThoughtLevel=t.liteThoughtLevel),o.length>0&&(i.available=o),Object.keys(i).length>0?i:void 0}"
+  );
+
+  const helpers = [
+    `function __zcodeParseRoleModel(e){if(typeof e!=="string"||!/^[A-Za-z0-9][A-Za-z0-9._:+\\/-]{0,255}$/.test(e)||!e.includes("/"))return;try{return ${parseModelRef}(e)}catch{return}}`,
+    "function __zcodeNormalizeRolePolicy(e){if(!e||typeof e!==\"object\"||Array.isArray(e))return;let t=[\"advisorModel\",\"advisorEffort\",\"gruntModel\",\"gruntEffort\"];if(!t.every(r=>typeof e[r]===\"string\"&&e[r].trim()))return;let r={advisorModel:e.advisorModel.trim(),advisorEffort:e.advisorEffort.trim(),gruntModel:e.gruntModel.trim(),gruntEffort:e.gruntEffort.trim()};if(!__zcodeParseRoleModel(r.advisorModel)||!__zcodeParseRoleModel(r.gruntModel)||!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(r.advisorEffort)||!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(r.gruntEffort))return;return Object.freeze(r)}",
+    "function __zcodeResolveAdvisorRolePolicy(e){if(e?.enabled===!1)return;let t=e?.enabledPlugins??{},r=Object.keys(t).filter(n=>(n===\"sol-advisor\"||n.startsWith(\"sol-advisor@\"))&&t[n]===!0);if(r.length!==1||r[0]!==\"sol-advisor@sol-advisor\")return;let n=e?.options?.[r[0]];return __zcodeNormalizeRolePolicy(n&&typeof n===\"object\"&&!Array.isArray(n)?{advisorModel:n.advisor_model,advisorEffort:n.advisor_effort,gruntModel:n.grunt_model,gruntEffort:n.grunt_effort}:void 0)}",
+    `function __zcodeSelectRuntimeRole(e,t,r,n,o){let i=t==="lite"?n?.gruntModel:n?.advisorModel,a=t==="lite"?n?.gruntEffort:n?.advisorEffort,u=i?__zcodeParseRoleModel(i):void 0,l=u?{...e,providerId:u.providerId,modelId:u.modelId}:e,c=a??(t==="lite"?r?.liteThoughtLevel:r?.mainThoughtLevel);if(c!==void 0){if(!l||o&&!${catalogLevelsFn}(l,o).includes(c)){let d=new Error("ZCODE_RUNTIME_ROUTE_UNSUPPORTED_THOUGHT_LEVEL");throw d.code="ZCODE_RUNTIME_ROUTE_UNSUPPORTED_THOUGHT_LEVEL",d}l={...l,variant:c}}return{modelRef:l,thoughtLevel:c}}`
+  ].join("");
+  replaceOnce(
+    "runtime helpers",
+    `function ${readConfigModel}(e){if(e.config.model)return e.config.model;`,
+    `${helpers}function ${readConfigModel}(e){if(e.config.model)return e.config.model;`
+  );
+
+  replaceOnce(
+    "main and lite selection",
+    bootstrap[0]!,
+    `_=n.bootstrapModelConfig??(n.modelAdapter?r.config.model:${readConfigModel}(r));let __zcodePolicy=n.runtimeConfig?.__zcodeRolePolicy??(n.runtimeConfig?.__zcodeDisableAdvisorOverlay||n.env?.ZCODE_RUNTIME_ROUTE_OVERRIDE==="1"?void 0:__zcodeResolveAdvisorRolePolicy(r.config.plugins)),y=n.runtimeConfig?.modelRef??(_?${toModelRef}(_):void 0),__zcodeMain=__zcodeSelectRuntimeRole(y,n.runtimeConfig?.__zcodeRouteRole==="lite"?"lite":"main",!__zcodePolicy&&n.runtimeConfig?.modelRef?void 0:_,__zcodePolicy,r.config.modelCatalog),v=__zcodePolicy?void 0:n.runtimeConfig?.modelProviderOptions,x=v?${overlayProviderOptions}(__zcodeMain.modelRef,v,r.config.modelCatalog):${resolveProviderOptions}(_,__zcodeMain.modelRef,r.config.modelCatalog,__zcodeMain.thoughtLevel??i,{strictPreferredThoughtLevel:__zcodeMain.thoughtLevel!==void 0}),w=_?.lite?${toLiteModelRef}(_):void 0,__zcodeLite=__zcodeSelectRuntimeRole(n.runtimeConfig?.liteModelRef??w,"lite",_,__zcodePolicy,r.config.modelCatalog),b=__zcodeLite.modelRef,k=__zcodePolicy?b?${resolveProviderOptions}(_,b,r.config.modelCatalog,__zcodeLite.thoughtLevel,{strictPreferredThoughtLevel:!0}):void 0:n.runtimeConfig?.liteModelProviderOptions??(b?${resolveProviderOptions}(_,b,r.config.modelCatalog,__zcodeLite.thoughtLevel,{strictPreferredThoughtLevel:__zcodeLite.thoughtLevel!==void 0}):void 0),S=`
+  );
+  replaceOnce(
+    "resolved main model",
+    runtimeConfigAssign[0]!,
+    `y=__zcodeMain.modelRef;let ${runtimeConfigAssign[1]!}={...n.runtimeConfig,...__zcodePolicy?{__zcodeRolePolicy:__zcodePolicy,__zcodeRouteRole:n.runtimeConfig?.__zcodeRouteRole??"main",__zcodeRoutePolicySource:n.runtimeConfig?.__zcodeRoutePolicySource==="persisted"?"persisted":n.runtimeConfig?.__zcodeRoutePolicySource==="parent"?"parent":"new",__zcodeRoutePersisted:n.runtimeConfig?.__zcodeRoutePolicySource==="persisted"||n.runtimeConfig?.__zcodeRoutePolicySource==="parent"}:{},bashTimeoutPolicy:`
+  );
+  replaceOnce(
+    "strict persistence availability",
+    persistFn[0]!,
+    `async function ${persistFnName}(e,t){if(!e.sessionStore?.saveSessionEntry){if(e.runtime.config?.__zcodeRolePolicy)throw new Error("ZCODE_RUNTIME_ROUTE_PERSISTENCE_UNAVAILABLE");return}`
+  );
+  replaceOnce(
+    "policy persistence payload",
+    "data:{modelId:String(r.modelId),providerId:String(r.providerId),...t?{thoughtLevel:t}:{}}})",
+    "data:{modelId:String(r.modelId),providerId:String(r.providerId),...t?{thoughtLevel:t}:{},...e.runtime.config?.__zcodeRolePolicy?{role:e.runtime.config.__zcodeRouteRole,policySource:e.runtime.config.__zcodeRoutePolicySource,rolePolicy:e.runtime.config.__zcodeRolePolicy}:{}}})"
+  );
+  replaceOnce(
+    "persistence logging",
+    '}catch(o){e.logger.warn("Session model selection persistence failed"',
+    '}catch(o){e.logger?.warn("Session model selection persistence failed"'
+  );
+  replaceOnce(
+    "strict persistence failure",
+    persistFail[0]!,
+    `status:"failed",thoughtLevel:t});if(e.runtime.config?.__zcodeRolePolicy)throw o}}function ${persistFail[1]!}`
+  );
+  replaceOnce(
+    "session route persistence",
+    sessionPersist[0]!,
+    `await ${sessionPersist[1]!}(this,t),this.sessionPersisted=!0;let __zcodePersistPolicy=this.config.__zcodeRolePolicy;if(__zcodePersistPolicy&&!this.config.__zcodeRoutePersisted){let __zcodePersistEffort=this.config.__zcodeRouteRole==="lite"?__zcodePersistPolicy.gruntEffort:__zcodePersistPolicy.advisorEffort;await ${persistFnName}({runtime:this,sessionStore:this.sessionStore,sessionId:this.sessionId,logger:this.logger,traceContext:t},__zcodePersistEffort),this.config.__zcodeRoutePersisted=!0}this.logger?.debug("Session persisted"`
+  );
+  replaceOnce(
+    "persisted policy reader",
+    thoughtReader[0]!,
+    `let l=typeof i.thoughtLevel=="string"?i.thoughtLevel.trim():"",c=__zcodeNormalizeRolePolicy(i.rolePolicy),d=i.role==="lite"?"lite":"main",p=i.policySource==="parent"||d==="lite"?"parent":"persisted";return{model:{modelId:${thoughtReader[1]!},providerId:${thoughtReader[2]!},...l?{variant:l}:{}},...l?{thoughtLevel:l}:{},...c?{rolePolicy:c,role:d,policySource:p}:{}}`
+  );
+  replaceOnce(
+    "restore policy input",
+    restoreCall[0]!,
+    `l&&(u.model=l.model,u.thoughtLevel=l.thoughtLevel,u.thoughtSource="session_entry");let c=await ${restoreCall[1]!}(e,{...t,mode:u.mode,model:${restoreCall[2]!}(t.runtimeModel,u.model),...l?.rolePolicy?{__zcodeRolePolicy:l.rolePolicy,__zcodeRouteRole:l.role==="lite"||o.parentID?"lite":"main",__zcodeRoutePolicySource:l.policySource==="parent"||o.parentID?"parent":"persisted"}:{__zcodeDisableAdvisorOverlay:!0},...o.parentID?{parentSessionId:String(o.parentID)}:{},workspace:i}`
+  );
+  replaceOnce(
+    "restore policy runtime config",
+    'runtimeConfig:{mode:"mode"in t?t.mode:void 0,modelRef:',
+    'runtimeConfig:{...t.__zcodeRolePolicy?{__zcodeRolePolicy:t.__zcodeRolePolicy,__zcodeRouteRole:t.__zcodeRouteRole??"main",__zcodeRoutePolicySource:t.__zcodeRoutePolicySource??"persisted"}:{},...t.__zcodeDisableAdvisorOverlay?{__zcodeDisableAdvisorOverlay:!0}:{},mode:"mode"in t?t.mode:void 0,modelRef:'
+  );
+  replaceOnce(
+    "restored policy availability",
+    restoredAvailability[0]!,
+    `${restoredAvailability[1]!}=t.taskType??"interactive",_=n&&!p&&!t.__zcodeRolePolicy&&!${restoredAvailability[2]!}(e,${restoredAvailability[3]!},${restoredAvailability[4]!}),${restoredAvailability[5]!}=${restoredAvailability[6]!}(t.mcpServers);`
+  );
+  replaceOnce(
+    "Agent route selection",
+    agentOptions[0]!,
+    `${agentOptions[1]!}=l?l.modelProviderOptions:c?void 0:${agentOptions[2]!}?${agentOptions[3]!}(e,i,t.profile):u?this.config.liteModelProviderOptions??this.config.modelProviderOptions:this.config.modelProviderOptions;let __zcodeRolePolicy=this.config.__zcodeRolePolicy;if(__zcodeRolePolicy){let __zcodeChild=__zcodeSelectRuntimeRole(this.config.liteModelRef??i,"lite",void 0,__zcodeRolePolicy);l=void 0,c=void 0,d=void 0,p={...__zcodeChild.modelRef,role:${subagentRole[1]!}.Subagent},m=e.resolveRuntimeModelLimits?.(p),${agentOptions[1]!}=e.resolveModelProviderOptions?.(p,__zcodeChild.thoughtLevel)}let _=${agentOptions[4]!}(this,p)`
+  );
+  replaceOnce(
+    "Agent child policy",
+    childCtor[0]!,
+    `let ${childCtor[1]!}=new ${childCtor[2]!}(t.sessionId,{...__zcodeRolePolicy?{__zcodeRolePolicy:__zcodeRolePolicy,__zcodeRouteRole:"lite",__zcodeRoutePolicySource:"parent"}:{},hooks:this.config.hooks,mode:${childCtor[3]!},modelRef:p,`
+  );
+  replaceOnce(
+    "Agent child persistence",
+    childPersist[0]!,
+    `${childPersist[1]!}?await ${childPersist[2]!}.resumeFromStore({traceContext:t.traceContext}):await ${childPersist[2]!}.ensureSessionPersistedForExternalActivity(t.prompt,{traceContext:t.traceContext}),${childPersist[2]!}.config.__zcodeRolePolicy&&!${childPersist[2]!}.config.__zcodeRoutePersisted&&(await ${persistFnName}({runtime:${childPersist[2]!},sessionStore:e.sessionStore,sessionId:t.sessionId,logger:this.logger,traceContext:t.traceContext},${childPersist[2]!}.config.__zcodeRolePolicy.gruntEffort),${childPersist[2]!}.config.__zcodeRoutePersisted=!0),await ${childPersist[3]!}(),`
+  );
+  return patched;
+}
+
+/** Add runtime-owned evidence to every native lifecycle hook payload. */
+export function patchRuntimeAttestation(runtime: string): string {
+  const marker = "function __zcodeRuntimeAttestation";
+  const requiredMarkers = [
+    marker,
+    'type:"zcode_runtime_attestation"',
+    'route:"native"',
+    "rolePolicyFingerprint",
+    "runtimeAttestation:__zcodeRuntimeAttestation",
+    "childRuntimeEvidence",
+    "__zcodeChildRuntimeEvidence",
+    "__zcodeDefineHidden",
+    "getRuntimeRouteConfig",
+    "function __zcodeWriteOdwAttestation",
+    "__zcodeRuntimeApp",
+    "ZCODE_ODW_RUNTIME_ATTESTATION"
+  ];
+  if (runtime.includes(marker)) {
+    if (requiredMarkers.every((value) => runtime.includes(value))) return runtime;
+    throw new Error("ZCode runtime has a partial runtime attestation patch.");
+  }
+
+  const matchOnce = (name: string, pattern: RegExp): RegExpExecArray => {
+    const match = pattern.exec(runtime);
+    if (!match) {
+      throw new Error(`ZCode runtime is incompatible with the runtime attestation patch (${name} anchor count 0).`);
+    }
+    return match;
+  };
+
+  const modelRefInput = matchOnce(
+    "tool executor route config input",
+    /getModelRef:([A-Za-z_$][\w$]*)\(\(\)=>e.defaultModelRef,"getModelRef"\),skillPort:/u
+  );
+  const childTurn = matchOnce(
+    "child runtime completion attestation",
+    /try\{return await ([A-Za-z_$][\w$]*)\.executeTurn\(t.prompt,void 0,\{abortSignal:r\?\.signal,\.\.\.d\?\{turnExecutionModel:d\}:\{\},inputSource:"subagent",traceContext:t.traceContext\}\)\}finally\{let ([A-Za-z_$][\w$]*)=r\?\.signal\?\.aborted===!0;/u
+  );
+  const sessionStart = matchOnce(
+    "SessionStart",
+    /hookEventName:([A-Za-z_$][\w$]*)\.SessionStart,mode:this.getMode\(\),model:([A-Za-z_$][\w$]*)\(this.defaultModelRef\),sessionId:this.sessionId,source:e,/u
+  );
+  const preToolUse = matchOnce(
+    "PreToolUse",
+    /hookEventName:([A-Za-z_$][\w$]*)\.PreToolUse,mode:o,riskLevel:n.metadata.riskLevel,sessionId:e.sessionId,sideEffectScope:n.metadata.sideEffectScope,/u
+  );
+  const postToolUse = matchOnce(
+    "PostToolUse",
+    /hookEventName:([A-Za-z_$][\w$]*)\.PostToolUse,mode:e.getMode\(\),sessionId:e.sessionId,timestamp:new Date\(\).toISOString\(\),toolCallId:t.id,/u
+  );
+  const postToolUseFailure = matchOnce(
+    "PostToolUseFailure",
+    /hookEventName:([A-Za-z_$][\w$]*)\.PostToolUseFailure,isInterrupt:([A-Za-z_$][\w$]*)\(([A-Za-z_$][\w$]*)\)&&\3\.type===([A-Za-z_$][\w$]*)\.ToolCancelled,mode:e.getMode\(\),sessionId:e.sessionId,timestamp:new Date\(\).toISOString\(\),toolCallId:t.id,/u
+  );
+  const odwBootstrap = matchOnce(
+    "ODW app capture declaration",
+    /try\{let I=o.env\?\?process.env,([A-Za-z_$][\w$]*)=\(o.cwd\?\?process.cwd\)\(\),([A-Za-z_$][\w$]*)=\(o.loadDotenv\?\?([A-Za-z_$][\w$]*)\)\(\{cwd:\1,env:I\}\);/u
+  );
+  const odwCatch = matchOnce(
+    "ODW provider failure footer",
+    /\}catch\(I\)\{let ([A-Za-z_$][\w$]*)=I instanceof Error\?I.message:String\(I\);/u
+  );
+  const helperHost = matchOnce(
+    "runtime helpers host",
+    /function ([A-Za-z_$][\w$]*)\(e\)\{if\(e.config.model\)return e.config.model;/u
+  );
+
+  const helper = [
+    'function __zcodeDefineHidden(e,t,r){if(!e||typeof e!=="object")return e;Object.defineProperty(e,t,{value:r,enumerable:!1,configurable:!0});return e}',
+    'function __zcodeRuntimeAttestation(e){let t=e.getModelRef(),c=e.config??e.getRuntimeRouteConfig?.(),r=c?.__zcodeRolePolicy??null,n=c?.__zcodeRouteRole==="lite"?"lite":"main",o=n==="lite"?(c?.parentSessionId??null):null,i=r?c?.__zcodeRoutePolicySource??"new":null,a=r?require("node:crypto").createHash("sha256").update(JSON.stringify({advisorModel:r.advisorModel,advisorEffort:r.advisorEffort,gruntModel:r.gruntModel,gruntEffort:r.gruntEffort})).digest("hex"):null;return{type:"zcode_runtime_attestation",schemaVersion:1,executor:"zcode",route:"native",runtimeId:String(e.sessionId),runtimeVersion:String(process.env.ZCODE_RUNTIME_VERSION??"unknown"),sessionId:String(e.sessionId),role:n,parentSessionId:o,policySource:i,rolePolicy:r,rolePolicyFingerprint:a,model:`${String(t.providerId)}/${String(t.modelId)}`,reasoningEffort:String(t.variant??"")}}',
+    'function __zcodeWriteOdwAttestation(e,t){if(process.env.ZCODE_ODW_PROTOCOL!=="1"||!t?.runtime)return;let r=t.runtime.getModelRef?.();if(!r)return;e.stderr.write(JSON.stringify({type:"zcode_runtime_attestation",schemaVersion:1,executor:"zcode",route:"odw",runtimeId:String(t.sessionId),runtimeVersion:String(process.env.ZCODE_RUNTIME_VERSION??"unknown"),sessionId:String(t.sessionId),role:"main",parentSessionId:null,policySource:null,rolePolicy:null,rolePolicyFingerprint:null,model:String(r.providerId)+"/"+String(r.modelId),reasoningEffort:String(r.variant??"")})+"\\n")}'
+  ].join("");
+
+  let patched = runtime;
+  const replaceOnce = (name: string, anchor: string, replacement: string) => {
+    const count = patched.split(anchor).length - 1;
+    if (count !== 1) {
+      throw new Error(`ZCode runtime is incompatible with the runtime attestation patch (${name} anchor count ${count}).`);
+    }
+    patched = patched.split(anchor).join(replacement);
+  };
+
+  replaceOnce(
+    "tool executor route config input",
+    modelRefInput[0]!,
+    `getModelRef:${modelRefInput[1]!}(()=>e.defaultModelRef,"getModelRef"),getRuntimeRouteConfig:${modelRefInput[1]!}(()=>e.config,"getRuntimeRouteConfig"),skillPort:`
+  );
+  replaceOnce(
+    "tool executor route config storage",
+    "getModelRef:t.getModelRef,skillPort:",
+    "getModelRef:t.getModelRef,getRuntimeRouteConfig:t.getRuntimeRouteConfig,skillPort:"
+  );
+  replaceOnce(
+    "child runtime completion attestation",
+    childTurn[0]!,
+    `try{let __zcodeChildTurnResult=await ${childTurn[1]!}.executeTurn(t.prompt,void 0,{abortSignal:r?.signal,...d?{turnExecutionModel:d}:{},inputSource:"subagent",traceContext:t.traceContext});return __zcodeDefineHidden(__zcodeChildTurnResult,"__zcodeRuntimeAttestation",__zcodeRuntimeAttestation(${childTurn[1]!}))}finally{let ${childTurn[2]!}=r?.signal?.aborted===!0;`
+  );
+  replaceOnce(
+    "foreground Agent child evidence",
+    "return{events:c.events,output:_}",
+    'if(c.__zcodeRuntimeAttestation?.role==="lite"&&c.__zcodeRuntimeAttestation.parentSessionId===String(t.sessionId))__zcodeDefineHidden(_,"__zcodeChildRuntimeEvidence",{childSessionId:String(r.childSessionId),parentSessionId:String(t.sessionId),parentToolCallId:String(t.parentToolCallId),state:"completed",runtimeAttestation:c.__zcodeRuntimeAttestation});return{events:c.events,output:_}'
+  );
+  replaceOnce(
+    "SessionStart",
+    sessionStart[0]!,
+    `hookEventName:${sessionStart[1]!}.SessionStart,mode:this.getMode(),model:${sessionStart[2]!}(this.defaultModelRef),sessionId:this.sessionId,runtimeAttestation:__zcodeRuntimeAttestation(this),source:e,`
+  );
+  replaceOnce(
+    "PreToolUse",
+    preToolUse[0]!,
+    `hookEventName:${preToolUse[1]!}.PreToolUse,mode:o,riskLevel:n.metadata.riskLevel,sessionId:e.sessionId,runtimeAttestation:__zcodeRuntimeAttestation(e),sideEffectScope:n.metadata.sideEffectScope,`
+  );
+  replaceOnce(
+    "PostToolUse",
+    postToolUse[0]!,
+    `hookEventName:${postToolUse[1]!}.PostToolUse,mode:e.getMode(),sessionId:e.sessionId,runtimeAttestation:__zcodeRuntimeAttestation(e),childRuntimeEvidence:t.name==="Agent"?(n?.__zcodeChildRuntimeEvidence??null):void 0,timestamp:new Date().toISOString(),toolCallId:t.id,`
+  );
+  replaceOnce(
+    "PostToolUseFailure",
+    postToolUseFailure[0]!,
+    `hookEventName:${postToolUseFailure[1]!}.PostToolUseFailure,isInterrupt:${postToolUseFailure[2]!}(${postToolUseFailure[3]!})&&${postToolUseFailure[3]!}.type===${postToolUseFailure[4]!}.ToolCancelled,mode:e.getMode(),sessionId:e.sessionId,runtimeAttestation:__zcodeRuntimeAttestation(e),timestamp:new Date().toISOString(),toolCallId:t.id,`
+  );
+  replaceOnce(
+    "ODW app capture declaration",
+    odwBootstrap[0]!,
+    `let __zcodeRuntimeApp;try{let I=o.env??process.env,${odwBootstrap[1]!}=(o.cwd??process.cwd)(),${odwBootstrap[2]!}=(o.loadDotenv??${odwBootstrap[3]!})({cwd:${odwBootstrap[1]!},env:I});`
+  );
+  replaceOnce(
+    "ODW app capture",
+    "_=P({browserControlPort:",
+    "__zcodeRuntimeApp=_=P({browserControlPort:"
+  );
+  replaceOnce(
+    "ODW provider failure footer",
+    odwCatch[0]!,
+    `}catch(I){__zcodeWriteOdwAttestation(e,__zcodeRuntimeApp);let ${odwCatch[1]!}=I instanceof Error?I.message:String(I);`
+  );
+  replaceOnce(
+    "runtime helpers host",
+    helperHost[0]!,
+    `${helper}${helperHost[0]!}`
+  );
+
+  const usagePrefix = /\(process\.env\.ZCODE_ODW_PROTOCOL==="1"&&([A-Za-z_$][\w$]*)\.stderr\.write\(JSON\.stringify\(\{type:"zcode_usage",sessionId:([A-Za-z_$][\w$]*)\.sessionId,/gu;
+  const usageMatches = [...patched.matchAll(usagePrefix)];
+  if (usageMatches.length < 2) {
+    throw new Error(`ZCode runtime is incompatible with the runtime attestation patch (ODW footer anchor count ${usageMatches.length}).`);
+  }
+  patched = patched.replace(usagePrefix, (_match, streamsVar: string, appVar: string) => (
+    `(/*ZCODE_ODW_RUNTIME_ATTESTATION*/process.env.ZCODE_ODW_PROTOCOL==="1"&&${streamsVar}.stderr.write(JSON.stringify({type:"zcode_runtime_attestation",schemaVersion:1,executor:"zcode",route:"odw",runtimeId:String(${appVar}.sessionId),runtimeVersion:String(process.env.ZCODE_RUNTIME_VERSION??"unknown"),sessionId:String(${appVar}.sessionId),role:"main",parentSessionId:null,policySource:null,rolePolicy:null,rolePolicyFingerprint:null,model:String(${appVar}.runtime.getModelRef().providerId)+"/"+String(${appVar}.runtime.getModelRef().modelId),reasoningEffort:String(${appVar}.runtime.getModelRef().variant??"")})+"\\n"),process.env.ZCODE_ODW_PROTOCOL==="1"&&${streamsVar}.stderr.write(JSON.stringify({type:"zcode_usage",sessionId:${appVar}.sessionId,`
+  ));
+  return patched;
+}
+
+/**
+ * Minified helper injected into the official runtime.
+ * 3.10.2 wraps SessionStart failures as `Turn execution failed` with the original
+ * error on `.cause`; protocol retries must surface the nested marker in RPC JSON.
+ * Protocol `sendInput` also returns `{completion}` instead of rejecting, so ZDi
+ * must await that promise before the catch can record `restoreWarning`.
+ */
+export const STRICT_ADVISOR_HOOK_FAILURE_MESSAGE_HELPER = "function __zcodeStrictAdvisorHookFailureMessage(e){for(let t=e,r=0;t&&r<8;t=t.cause,r++){let n=String(t?.message??t);if(n.includes(\"ZCODE_STRICT_ADVISOR_HOOK_FAILURE\"))return n}}";
+
+/** Make only the exact Advisor plugin hook source fail closed on lifecycle errors. */
+export function patchRuntimeStrictAdvisorHooks(runtime: string): string {
+  const marker = "function __zcodeIsStrictAdvisorHook";
+  const requiredMarkers = [
+    marker,
+    "function __zcodeStrictAdvisorHookFailureMessage",
+    "ZCODE_STRICT_ADVISOR_HOOK_FAILURE",
+    "ZCODE_SESSION_START_HOOK_STATE",
+    "let _zcodeSendResult=await t.app.sendInput({attachments:"
+  ];
+  if (runtime.includes(marker)) {
+    if (requiredMarkers.every((value) => runtime.includes(value))) return runtime;
+    throw new Error("ZCode runtime has a partial strict Advisor hook patch.");
+  }
+
+  const matchOnce = (name: string, pattern: RegExp): RegExpExecArray => {
+    const match = pattern.exec(runtime);
+    if (!match) {
+      throw new Error(`ZCode runtime is incompatible with the strict Advisor hook patch (${name} anchor count 0).`);
+    }
+    return match;
+  };
+
+  const foregroundEmpty = matchOnce(
+    "foreground empty output",
+    /let v=await this.runCallbackWithTimeout\(d,t,c,r.signal\),x=Date.now\(\)-_,w=([A-Za-z_$][\w$]*)\(t.hookEventName,v\);/u
+  );
+  const foregroundFail = matchOnce(
+    "foreground failure",
+    /\}catch\(v\)\{let x=Date.now\(\)-_,w=([A-Za-z_$][\w$]*)\(v\),b=([A-Za-z_$][\w$]*)\(([A-Za-z_$][\w$]*)\(v\)\);/u
+  );
+  const backgroundEmpty = matchOnce(
+    "background empty output",
+    /await this.runCallbackWithTimeout\(o,l,d,c\),await this.emitHookEvent/u
+  );
+  const backgroundFail = matchOnce(
+    "background failure",
+    /\}catch\(m\)\{let ([A-Za-z_$][\w$]*)=Date.now\(\)-p,_=([A-Za-z_$][\w$]*)\(m\),y=([A-Za-z_$][\w$]*)\(([A-Za-z_$][\w$]*)\(m\)\);/u
+  );
+  const protocolFail = matchOnce(
+    "protocol strict failure state",
+    /catch\(c\)\{o="prompt_failed",e.logger\?\.warn\("ZCode Protocol background turn failed",/u
+  );
+  const protocolSend = matchOnce(
+    "protocol send completion",
+    /try\{await t\.app\.sendInput\(\{attachments:/u
+  );
+  const protocolCompleted = matchOnce(
+    "protocol turn completed log",
+    /:\{\}\}\),e\.logger\?\.info\("ZCode Protocol background turn completed"/u
+  );
+  const sessionStart = matchOnce(
+    "session-start reuse",
+    /async function ([A-Za-z_$][\w$]*)\(e,t,r\)\{return this.sessionStartHookRan\|\|\(await this.workspaceHookAdmission\?\.activate\(e,r\),this.sessionStartHookRan=!0,!this.hookRunner\)\?([A-Za-z_$][\w$]*):this.hookRunner.run\(/u
+  );
+  const helperHost = matchOnce(
+    "runtime helpers host",
+    /function ([A-Za-z_$][\w$]*)\(e\)\{if\(e.config.model\)return e.config.model;/u
+  );
+
+  let patched = runtime;
+  const replaceOnce = (name: string, anchor: string, replacement: string) => {
+    const count = patched.split(anchor).length - 1;
+    if (count !== 1) {
+      throw new Error(`ZCode runtime is incompatible with the strict Advisor hook patch (${name} anchor count ${count}).`);
+    }
+    patched = patched.split(anchor).join(replacement);
+  };
+
+  replaceOnce(
+    "strict hook helper",
+    helperHost[0]!,
+    `${STRICT_ADVISOR_HOOK_FAILURE_MESSAGE_HELPER}function __zcodeIsStrictAdvisorHook(e){return typeof e?.source==="string"&&e.source.startsWith("plugin.sol-advisor@sol-advisor.")}${helperHost[0]!}`
+  );
+  replaceOnce(
+    "foreground empty output",
+    "let v=await this.runCallbackWithTimeout(d,t,c,r.signal),x=Date.now()-_,",
+    'let v=await this.runCallbackWithTimeout(d,t,c,r.signal);if(__zcodeIsStrictAdvisorHook(d)&&v===void 0)throw new Error("ZCODE_STRICT_ADVISOR_HOOK_FAILURE: empty output");let x=Date.now()-_,'
+  );
+  replaceOnce(
+    "foreground failure",
+    foregroundFail[0]!,
+    `}catch(v){if(__zcodeIsStrictAdvisorHook(d))throw new Error("ZCODE_STRICT_ADVISOR_HOOK_FAILURE: "+${foregroundFail[3]!}(v),{cause:v});let x=Date.now()-_,w=${foregroundFail[1]!}(v),b=${foregroundFail[2]!}(${foregroundFail[3]!}(v));`
+  );
+  replaceOnce(
+    "background empty output",
+    backgroundEmpty[0]!,
+    'let result=await this.runCallbackWithTimeout(o,l,d,c);if(__zcodeIsStrictAdvisorHook(o)&&result===void 0)throw new Error("ZCODE_STRICT_ADVISOR_HOOK_FAILURE: empty output");await this.emitHookEvent'
+  );
+  replaceOnce(
+    "background failure",
+    backgroundFail[0]!,
+    `}catch(m){if(__zcodeIsStrictAdvisorHook(o))throw new Error("ZCODE_STRICT_ADVISOR_HOOK_FAILURE: "+${backgroundFail[4]!}(m),{cause:m});let ${backgroundFail[1]!}=Date.now()-p,_=${backgroundFail[2]!}(m),y=${backgroundFail[3]!}(${backgroundFail[4]!}(m));`
+  );
+  replaceOnce(
+    "protocol strict failure state",
+    protocolFail[0]!,
+    'catch(c){let _zcodeStrictAdvisorHookFailure=__zcodeStrictAdvisorHookFailureMessage(c);if(_zcodeStrictAdvisorHookFailure)t.restoreWarning={type:"zcode_strict_advisor_hook_failure",message:_zcodeStrictAdvisorHookFailure};o="prompt_failed",e.logger?.warn("ZCode Protocol background turn failed",'
+  );
+  replaceOnce(
+    "protocol send completion",
+    protocolSend[0]!,
+    "try{let _zcodeSendResult=await t.app.sendInput({attachments:"
+  );
+  replaceOnce(
+    "protocol turn completed log",
+    protocolCompleted[0]!,
+    ":{}});let _zcodeSendDone=_zcodeSendResult?.completion??_zcodeSendResult?.result;if(_zcodeSendDone)await _zcodeSendDone;e.logger?.info(\"ZCode Protocol background turn completed\""
+  );
+  replaceOnce(
+    "session-start reuse",
+    sessionStart[0]!,
+    `async function ${sessionStart[1]!}(e,t,r){return this.sessionStartHookRan?${sessionStart[2]!}:(await this.workspaceHookAdmission?.activate(e,r),/*ZCODE_SESSION_START_HOOK_STATE*/(!this.hookRunner?(this.sessionStartHookRan=!0,${sessionStart[2]!}):this.hookRunner.run(`
+  );
+  replaceOnce(
+    "session-start hook success",
+    "},{matchValue:e,signal:r})}",
+    "},{matchValue:e,signal:r}).then((n=>{this.sessionStartHookRan=!0;return n}))))}"
+  );
+  return patched;
 }
 
 async function installTuiBridge(nextVendor: string): Promise<RuntimePatchReport[]> {

@@ -14,7 +14,9 @@ interface ConfigTemplate {
   provider: Record<string, TemplateProvider>;
   model: {
     main: string;
+    mainThoughtLevel: string;
     lite: string;
+    liteThoughtLevel: string;
   };
   modelStream: {
     idleTimeoutMs: number;
@@ -29,6 +31,10 @@ interface ConfigTemplate {
       method: string;
       condition: string;
     };
+  };
+  hooks: {
+    enabled: boolean;
+    events: Record<string, unknown[]>;
   };
 }
 
@@ -50,7 +56,23 @@ test("custom-provider config template is internally consistent", async () => {
   expect(config.ui.theme).toBe("auto");
   expect(config.ui.copyOnSelect).toBe(true);
   expect(config.ui.notifications).toEqual({ method: "auto", condition: "unfocused" });
-  // The runtime's user-config model schema is strict: only main/lite are accepted
-  // (model.available is a runtime-internal key injected by the app host, not user config).
-  expect(Object.keys(config.model).sort()).toEqual(["lite", "main"]);
+  expect(config.hooks.enabled).toBe(false);
+  expect(config.hooks.events).toEqual({
+    SessionStart: [],
+    UserPromptSubmit: [],
+    PreToolUse: [],
+    PermissionRequest: [],
+    PostToolUse: [],
+    PostToolUseFailure: [],
+    Stop: []
+  });
+  expect(config.model.mainThoughtLevel).toBe("max");
+  expect(config.model.liteThoughtLevel).toBe("enabled");
+  // model.available remains runtime-internal rather than a user-config key.
+  expect(Object.keys(config.model).sort()).toEqual([
+    "lite",
+    "liteThoughtLevel",
+    "main",
+    "mainThoughtLevel"
+  ]);
 });
