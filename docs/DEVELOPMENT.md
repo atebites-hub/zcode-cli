@@ -67,9 +67,11 @@ Open the printed URL in a browser, then return to the waiting CLI. On macOS the
 listens on localhost for the same registered callback and also accepts a pasted
 `zcode://` URL (or authorization code) if the browser cannot hand it back.
 Cross-device SSH login works by pasting that callback URL into the remote
-session; do not fall back to API-key paste for this flow. The wrapper no longer
-uses the upstream `oauth/cli/init` polling endpoint, which currently returns
-HTTP 404.
+session; do not fall back to API-key paste for this flow. After a Desktop
+login, Import or `zcode -p` can also map existing
+`~/.zcode/v2/credentials.json` tokens onto `provider.zai.options.apiKey`.
+The wrapper no longer uses the upstream `oauth/cli/init` polling endpoint,
+which currently returns HTTP 404.
 
 Verify native callback capture and automatic handler restoration without
 contacting Z.AI or changing the real `zcode://` association:

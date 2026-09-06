@@ -30,7 +30,8 @@ import {
 } from "./zai-oauth.ts";
 import { requestAppServer } from "./app-server-client.ts";
 import { runPluginCommand } from "./plugin-cli.ts";
-import { missingCodingPlanKey } from "./prompt-preflight.ts";
+import { syncCliAuthFromDesktop, type SyncCliAuthOptions } from "./cli-auth-sync.ts";
+import { ensureCodingPlanAccess } from "./prompt-preflight.ts";
 import {
   capabilitiesFromExtractionMetadata,
   type RuntimeCliOptionType
@@ -260,13 +261,19 @@ function inspectRuntimeInvocation(
 }
 
 export async function promptPreflight(
-  args: string[], env: NodeJS.ProcessEnv = process.env
+  args: string[],
+  env: NodeJS.ProcessEnv = process.env,
+  extras?: Pick<SyncCliAuthOptions, "fallbackHome" | "platform" | "resolveApiKey" | "username">
 ): Promise<string | undefined> {
   const invocation = inspectRuntimeInvocation(args, readRuntimeCliOptionTypes());
   if (!invocation.agentInvocation || invocation.invalid || invocation.passthrough || invocation.resume) {
     return undefined;
   }
-  return missingCodingPlanKey({ env, workingDirectory: invocation.workingDirectory });
+  return ensureCodingPlanAccess({
+    env,
+    workingDirectory: invocation.workingDirectory,
+    ...extras
+  });
 }
 
 export function withDefaultBrowserUse(
@@ -951,6 +958,7 @@ export async function main(args: string[]): Promise<number> {
   const login = normalizeLoginArgs(args);
   const zaiOAuth = classifyZaiOAuthInvocation(args);
   if (login.checkConfiguredAccess) {
+    await syncCliAuthFromDesktop().catch(() => undefined);
     const access = await readConfiguredModelAccess();
     if (access) {
       console.log(

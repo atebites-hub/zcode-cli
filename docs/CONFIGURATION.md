@@ -4,16 +4,23 @@
 
 Ordinary TUI input and new headless `--prompt`, `--print`, `-p`, and `--target`
 requests diagnose a clearly keyless Z.AI/BigModel Coding Plan configuration
-before starting a model turn. The TUI restores rejected input to an empty editor,
-or retains it in the follow-up queue without replacing a newer draft. Rejected
-queued input keeps its position and metadata; auto-send pauses until user action.
-Headless commands exit unsuccessfully with setup instructions.
+before starting a model turn. When `provider.zai.options.apiKey` is empty, the
+CLI first tries to map existing Desktop OAuth tokens from
+`~/.zcode/v2/credentials.json` onto that field (see
+[How the CLI obtains Z.AI credentials after Desktop login](#how-the-cli-obtains-zai-credentials-after-desktop-login)).
+The keyless diagnostic itself stays local: it does not print secrets. If token
+mapping needs a Coding Plan key, that resolve step talks to `api.z.ai` and
+writes only the resulting key into `config.json`.
+
+The TUI restores rejected input to an empty editor, or retains it in the
+follow-up queue without replacing a newer draft. Rejected queued input keeps
+its position and metadata; auto-send pauses until user action. Headless
+commands exit unsuccessfully with setup instructions.
 
 This is deliberately not a general credentials validator. Custom endpoints,
 environment authentication/model overrides, ancestor project configurations,
 dotenv files, and resumed headless sessions remain the runtime's responsibility.
-Login, setup, help, and other management commands remain available. No credentials
-are printed, changed, or tested over the network by this check.
+Login, setup, help, and other management commands remain available.
 
 This document covers the detailed model-access configuration for
 zcode-app-cli. For installation and basic usage, see the
@@ -44,10 +51,10 @@ first created, survives non-interactive commands (`zcode plugin list`,
 interactive TUI start, and is cleared once setup is handled — finishing or
 explicitly skipping the wizard, choosing the custom-provider help entry,
 deferring the post-import sign-in, or configuring model access by any other
-means (`zcode login`, a hand-edited `config.json`), in which case the wizard
-does not appear at all. The marker is only kept when login or the desktop
-import was attempted and failed, so an unconfigured user is guided again on
-the next start. Press Esc to skip the wizard. It can be reopened anytime with
+means (`zcode login`, desktop OAuth token mapping, a hand-edited `config.json`),
+in which case the wizard does not appear at all. The marker is only kept when
+login or the desktop import was attempted and failed, so an unconfigured user
+is guided again on the next start. Press Esc to skip the wizard. It can be reopened anytime with
 `/setup`, and it never appears for an existing configuration unless invoked
 manually.
 
@@ -64,11 +71,37 @@ exist after the import. A backup of the pre-import `config.json` is written
 next to it as `config.json.pre-migration.bak`; if the backup cannot be
 written, the import is aborted before any change is made.
 
-Desktop credentials are never copied: the desktop app stores them encrypted
-(`enc:v1:`) with a key held by the desktop process, and the CLI reads desktop
-files only. After importing, sign in once via the offered login step (or
-`/login` later) so a fresh Coding Plan API key lands in the CLI config. An
-existing CLI-side `apiKey` for the same provider is always preserved.
+### How the CLI obtains Z.AI credentials after Desktop login
+
+Desktop login writes OAuth tokens to `~/.zcode/v2/credentials.json`
+(`oauth:zai:access_token`, optional `zcodejwttoken` / user info). Values are
+usually `enc:v1:` AES-256-GCM ciphertext. The CLI decrypts them with the same
+machine-bound key the official runtime uses:
+`SHA-256(ZCODE_CREDENTIAL_SECRET)` or, when that env var is unset,
+`SHA-256("zcode-credential-fallback:{platform}:{home}:{username}")`. Encrypted
+blobs are never copied into `~/.zcode/cli/config.json`.
+
+Headless prompts (`zcode -p`, `--prompt`, `--print`, `--target`) and the TUI
+then map those tokens onto the CLI auth surface that already unlocks model
+calls: `provider.zai.options.apiKey` in `~/.zcode/cli/config.json`.
+
+1. If that field already has a usable plaintext key, it is left unchanged.
+2. If the desktop provider block in `~/.zcode/v2/config.json` has a plaintext
+   or decryptable `apiKey`, Import copies that value.
+3. Otherwise the CLI reads `~/.zcode/v2/credentials.json`, decrypts the Z.AI
+   access token, and resolves the account's Coding Plan key named
+   `zcode-api-key` (business login → customer org/project → find or create the
+   key → copy the secret). That resolved key is written to
+   `provider.zai.options.apiKey`.
+
+`zcode login` uses the registered `zcode://` callback on every supported
+platform (localhost listener plus paste fallback on Linux and Windows). After a
+Desktop login, Import or the next `zcode -p` auto-sync is enough; a second
+Coding Plan API key paste is not required. If tokens are missing, undecryptable
+for this user/`HOME`, or key resolution fails, preflight still blocks the
+prompt and does not invent a key.
+
+An existing CLI-side `apiKey` for the same provider is always preserved.
 
 ## Model-access paths
 
@@ -78,7 +111,9 @@ Three model-access paths are supported:
   `zcode login --oauth` to force reauthorization; add `--no-browser` to print
   the authorization URL instead of opening a browser (useful over SSH). On
   Linux and Windows, paste the `zcode://` callback URL if the browser cannot
-  hand it back automatically;
+  hand it back automatically. After a Desktop login, Import or `zcode -p` can
+  map `~/.zcode/v2/credentials.json` onto the CLI apiKey without a second key
+  paste;
 - **Z.AI/BigModel Coding Plan API key**: open `/login` in the TUI and choose the
   matching masked API-key option;
 - **Direct API key with a custom provider**: use the

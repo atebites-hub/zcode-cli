@@ -6,7 +6,7 @@ const home = process.env.HOME!;
 const events = join(home, "events.jsonl");
 let checks = 0;
 mock.module("../../src/prompt-preflight.ts", () => ({
-  missingCodingPlanKey: async () => {
+  ensureCodingPlanAccess: async () => {
     const check = ++checks;
     await appendFile(events, JSON.stringify({ check }) + "\n");
     if (check === 1) {
