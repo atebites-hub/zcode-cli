@@ -25,6 +25,18 @@ const apiKeyLoginPattern = /^\/login\s+(?:zai|bigmodel)-coding-plan-api-key(?:\s
 export const setupLoginFinishedWithoutAccessNotice =
   "Login did not produce model access · run /login or /setup to try again.";
 
+export const setupSkippedNotice = "Setup skipped · run /login or /setup anytime.";
+
+export function shouldDismissFirstRunSetup(input: {
+  aborted?: boolean;
+  skipRequested?: boolean;
+  selectedValue?: string | null;
+}): boolean {
+  if (input.aborted === true || input.skipRequested === true) return true;
+  return "selectedValue" in input
+    && (input.selectedValue == null || input.selectedValue === "skip");
+}
+
 export function isCodingPlanLoginPickerCommand(command: string): boolean {
   return codingPlanLoginPattern.test(command);
 }

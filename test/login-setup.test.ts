@@ -4,7 +4,9 @@ import {
   classifySetupLoginCommand,
   decideSetupAfterLogin,
   isCodingPlanLoginPickerCommand,
-  setupLoginFinishedWithoutAccessNotice
+  setupLoginFinishedWithoutAccessNotice,
+  setupSkippedNotice,
+  shouldDismissFirstRunSetup
 } from "../packages/zcode-tui/src/login-setup.ts";
 
 describe("setup login command classification", () => {
@@ -80,6 +82,16 @@ describe("first-run setup after /login", () => {
       interaction: { kind: "custom-help" },
       manual: false
     })).toEqual({ action: "leave", clearPending: true });
+  });
+
+  test("dismisses first-run on Esc, Skip, or an early skip request", () => {
+    expect(shouldDismissFirstRunSetup({ selectedValue: null })).toBe(true);
+    expect(shouldDismissFirstRunSetup({ selectedValue: "skip" })).toBe(true);
+    expect(shouldDismissFirstRunSetup({ skipRequested: true, selectedValue: "sign-in" })).toBe(true);
+    expect(shouldDismissFirstRunSetup({ aborted: true, selectedValue: "sign-in" })).toBe(true);
+    expect(shouldDismissFirstRunSetup({ selectedValue: "sign-in" })).toBe(false);
+    expect(shouldDismissFirstRunSetup({ aborted: false, skipRequested: false })).toBe(false);
+    expect(setupSkippedNotice).toMatch(/Setup skipped/i);
   });
 
   test("lets an explicit /setup retry methods after a failed attempt", () => {

@@ -184,6 +184,8 @@ import {
   classifySetupLoginCommand,
   decideSetupAfterLogin,
   isCodingPlanLoginPickerCommand,
+  setupSkippedNotice,
+  shouldDismissFirstRunSetup,
   type SetupLoginInteraction
 } from "./login-setup.ts";
 import {
@@ -699,6 +701,9 @@ class ZCodeTui {
   private updateCheckAbortController?: AbortController;
   private loginRequired: boolean;
   private setupLoginInteraction?: SetupLoginInteraction;
+  private firstRunSetupArmed = false;
+  private firstRunSkipRequested = false;
+  private firstRunAbort?: AbortController;
   private removeStreamErrorGuards?: () => void;
 
   constructor(private readonly options: TuiOptions) {
@@ -851,6 +856,7 @@ class ZCodeTui {
       if (updateCheck?.availableVersion && this.distributionVersion) {
         this.addUpdateAvailable(this.distributionVersion, updateCheck.availableVersion);
       }
+      this.firstRunSetupArmed = await readSetupPending().catch(() => false);
       this.bindInput();
       this.notifications.start();
       this.focusEditor();
@@ -860,17 +866,24 @@ class ZCodeTui {
       this.startUpdateRefresh(updateCheck);
       if (!this.loginRequired) void this.refreshGoal();
       if (!this.loginRequired) void this.refreshSessionUsage();
-      if (await readSetupPending().catch(() => false)) {
-        await syncCliAuthFromDesktop().catch(() => undefined);
-        if (await readConfiguredModelAccess().catch(() => null)) {
-          // The user already configured model access outside the wizard (for
-          // example via `zcode login`, desktop OAuth tokens, or a hand-edited
-          // config.json); honor that as completed setup instead of showing the
-          // wizard again.
-          await clearSetupPending().catch(() => {});
-          this.setLoginRequired(false);
+      if (this.firstRunSetupArmed) {
+        if (this.firstRunSkipRequested) {
+          await this.dismissFirstRunSetup();
         } else {
-          void this.runFirstRunSetup();
+          await syncCliAuthFromDesktop().catch(() => undefined);
+          if (await readConfiguredModelAccess().catch(() => null)) {
+            // The user already configured model access outside the wizard (for
+            // example via `zcode login`, desktop OAuth tokens, or a hand-edited
+            // config.json); honor that as completed setup instead of showing the
+            // wizard again.
+            this.firstRunSetupArmed = false;
+            await clearSetupPending().catch(() => {});
+            this.setLoginRequired(false);
+          } else if (this.firstRunSkipRequested) {
+            await this.dismissFirstRunSetup();
+          } else {
+            void this.runFirstRunSetup();
+          }
         }
       }
       this.scheduleRuntimePoll(0);
@@ -1255,7 +1268,29 @@ class ZCodeTui {
     this.ui.requestRender(true);
   }
 
+  private requestFirstRunSkip(): boolean {
+    if (!this.firstRunSetupArmed || this.choiceDepth > 0) return false;
+    this.firstRunSkipRequested = true;
+    this.firstRunAbort?.abort();
+    return true;
+  }
+
+  private finishFirstRunSetup(): void {
+    this.firstRunSetupArmed = false;
+    this.firstRunSkipRequested = false;
+    this.firstRunAbort = undefined;
+    this.setupLoginInteraction = undefined;
+  }
+
+  private async dismissFirstRunSetup(manual = false): Promise<void> {
+    this.finishFirstRunSetup();
+    await clearSetupPending().catch(() => {});
+    if (!manual) this.addNotice(setupSkippedNotice, "muted");
+    this.restoreInteractiveTerminal();
+  }
+
   private async completeConfiguredSetup(access: { configPath: string; model: string }): Promise<void> {
+    this.finishFirstRunSetup();
     await clearSetupPending().catch(() => {});
     this.model = access.model;
     this.setLoginRequired(false);
@@ -1549,6 +1584,7 @@ class ZCodeTui {
           return { consume: true };
         }
         if (!this.editor.getText() && this.activeSubmissions === 0) {
+          if (this.requestFirstRunSkip()) return { consume: true };
           this.handleRewindEscape();
           return { consume: true };
         }
@@ -4123,6 +4159,10 @@ class ZCodeTui {
   }
 
   private async runFirstRunSetup(manual = false): Promise<void> {
+    if (!manual) {
+      this.firstRunSetupArmed = true;
+      this.firstRunAbort = new AbortController();
+    }
     let desktop: DesktopInstallation | null = null;
     try {
       desktop = await detectDesktopInstallation();
@@ -4134,6 +4174,13 @@ class ZCodeTui {
       const access = await readConfiguredModelAccess().catch(() => null);
       if (access && !manual) {
         await this.completeConfiguredSetup(access);
+        return;
+      }
+      if (!manual && shouldDismissFirstRunSetup({
+        aborted: this.firstRunAbort?.signal.aborted,
+        skipRequested: this.firstRunSkipRequested
+      })) {
+        await this.dismissFirstRunSetup(manual);
         return;
       }
       const statusHint = access
@@ -4171,18 +4218,20 @@ class ZCodeTui {
         title: manual ? "ZCode setup" : "Welcome to ZCode CLI",
         prompt: manual ? statusHint : `Set up model access to get started. ${statusHint}`,
         help: "Up/Down choose · Enter select · Esc skip",
-        items
+        items,
+        signal: manual ? undefined : this.firstRunAbort?.signal
       });
-      if (!selected || selected.value === "skip") {
-        await clearSetupPending().catch(() => {});
-        if (!manual) {
-          this.addNotice("Setup skipped · run /login or /setup anytime.", "muted");
-        }
-        this.restoreInteractiveTerminal();
+      if (shouldDismissFirstRunSetup({
+        aborted: this.firstRunAbort?.signal.aborted,
+        skipRequested: this.firstRunSkipRequested,
+        selectedValue: selected?.value
+      }) || !selected) {
+        await this.dismissFirstRunSetup(manual);
         return;
       }
 
       if (selected.value === customProviderHelpCommand) {
+        this.finishFirstRunSetup();
         await clearSetupPending().catch(() => {});
         const configPath = userConfigPathHint();
         this.addNotice(
@@ -4222,6 +4271,7 @@ class ZCodeTui {
         if (decision.notice) this.addNotice(decision.notice.text, decision.notice.tone);
         if (decision.clearPending) await clearSetupPending().catch(() => {});
         if (decision.action === "leave") {
+          this.finishFirstRunSetup();
           this.restoreInteractiveTerminal();
           return;
         }
