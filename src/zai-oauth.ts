@@ -5,6 +5,11 @@ import {
   type DarwinUrlCallbackReceiver
 } from "./darwin-oauth-callback.ts";
 import { captureCommand } from "./command.ts";
+import {
+  createPortableOAuthCallbackReceiver,
+  type CommandRunner,
+  type OAuthCallbackReceiver
+} from "./portable-oauth-callback.ts";
 
 const authorizeEndpoint = "https://chat.z.ai/api/oauth/authorize";
 const clientId = "client_P8X5CMWmlaRO9gyO-KSqtg";
@@ -43,12 +48,15 @@ export interface ZaiOAuthLoginOptions {
   createReceiver?: (options: {
     env: NodeJS.ProcessEnv;
     scheme: string;
-  }) => Promise<DarwinUrlCallbackReceiver>;
+  }) => Promise<OAuthCallbackReceiver | DarwinUrlCallbackReceiver>;
   env?: NodeJS.ProcessEnv;
+  input?: NodeJS.ReadableStream | null;
   invocation: ZaiOAuthInvocation;
   openBrowser?: (url: string) => Promise<BrowserOpenResult>;
   output?: WritableOutput;
   platform?: NodeJS.Platform;
+  registerSchemeHandler?: boolean;
+  runCommand?: CommandRunner;
   state?: string;
   timeoutMs?: number;
 }
@@ -75,6 +83,32 @@ export function buildZaiAuthorizeUrl(state: string): string {
     state
   }).toString();
   return url.toString();
+}
+
+export function browserOpenCommand(
+  platform: NodeJS.Platform,
+  url: string
+): { args: string[]; command: string } {
+  switch (platform) {
+    case "darwin":
+      return { args: [url], command: "/usr/bin/open" };
+    case "win32":
+      return { args: ["/c", "start", "", url], command: "cmd.exe" };
+    case "aix":
+    case "android":
+    case "freebsd":
+    case "haiku":
+    case "linux":
+    case "openbsd":
+    case "sunos":
+    case "cygwin":
+    case "netbsd":
+      return { args: [url], command: "xdg-open" };
+    default: {
+      const exhaustive: never = platform;
+      return exhaustive;
+    }
+  }
 }
 
 function statesMatch(actual: string, expected: string): boolean {
@@ -112,27 +146,52 @@ export function parseZaiOAuthCallback(callbackUrl: string, expectedState: string
   return { callbackUrl, code, state };
 }
 
-async function openBrowser(url: string): Promise<BrowserOpenResult> {
-  const result = await captureCommand("/usr/bin/open", [url]);
+export function parseZaiOAuthCallbackInput(input: string, expectedState: string): ZaiOAuthCallback {
+  const trimmed = input.trim();
+  if (!trimmed) throw new Error("Z.AI OAuth callback did not include an authorization code.");
+  const embedded = /zcode:\/\/zai-auth\/callback[^\s]*/u.exec(trimmed);
+  if (embedded) return parseZaiOAuthCallback(embedded[0], expectedState);
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/u.test(trimmed)) {
+    return parseZaiOAuthCallback(trimmed, expectedState);
+  }
+  return parseZaiOAuthCallback(
+    `${redirectUri}?code=${encodeURIComponent(trimmed)}&state=${encodeURIComponent(expectedState)}`,
+    expectedState
+  );
+}
+
+function callbackWaitingMessage(platform: NodeJS.Platform): string {
+  if (platform === "darwin") return "Waiting for the zcode:// callback...\n";
+  return [
+    "After authorizing, the browser will try to open a zcode:// link.",
+    "If this terminal does not continue automatically, copy the full callback URL",
+    "from the address bar (it starts with zcode://zai-auth/callback) and paste it below.",
+    "Waiting for the zcode:// callback...\n"
+  ].join("\n");
+}
+
+async function openBrowser(url: string, platform: NodeJS.Platform): Promise<BrowserOpenResult> {
+  const { args, command } = browserOpenCommand(platform, url);
+  const result = await captureCommand(command, args);
   return result.code === 0
     ? { opened: true }
-    : { opened: false, reason: result.stderr.trim() || `open exited with status ${result.code}` };
+    : { opened: false, reason: result.stderr.trim() || `${command} exited with status ${result.code}` };
 }
 
 export async function runZaiOAuthLogin(options: ZaiOAuthLoginOptions): Promise<number> {
   const platform = options.platform ?? process.platform;
-  if (platform !== "darwin") {
-    throw new Error(
-      "Z.AI browser login requires macOS for the registered zcode:// callback. "
-      + "Use the Z.AI Coding Plan API Key option in /login on this platform."
-    );
-  }
-
   const env = options.env ?? process.env;
   const state = options.state ?? randomBytes(32).toString("hex");
   const output = options.output ?? process.stdout;
   const createReceiver = options.createReceiver ?? ((receiverOptions) => (
-    createDarwinUrlCallbackReceiver(receiverOptions)
+    platform === "darwin"
+      ? createDarwinUrlCallbackReceiver(receiverOptions)
+      : createPortableOAuthCallbackReceiver({
+        ...receiverOptions,
+        input: options.input === undefined ? process.stdin : options.input,
+        registerSchemeHandler: options.registerSchemeHandler ?? platform === "linux",
+        runCommand: options.runCommand
+      })
   ));
   const receiver = await createReceiver({ env, scheme: "zcode" });
   let disposed = false;
@@ -145,20 +204,24 @@ export async function runZaiOAuthLogin(options: ZaiOAuthLoginOptions): Promise<n
   try {
     const authorizeUrl = buildZaiAuthorizeUrl(state);
     if (options.invocation.noBrowser) {
-      output.write(`Open this URL to sign in:\n${authorizeUrl}\nWaiting for the zcode:// callback...\n`);
+      output.write(`Open this URL to sign in:\n${authorizeUrl}\n${callbackWaitingMessage(platform)}`);
     } else {
       output.write(`Opening browser for Z.AI authorization.\nFallback URL:\n${authorizeUrl}\n`);
-      const result = await (options.openBrowser ?? openBrowser)(authorizeUrl);
+      if (platform !== "darwin") output.write(callbackWaitingMessage(platform));
+      const result = await (options.openBrowser ?? ((url) => openBrowser(url, platform)))(authorizeUrl);
       if (!result.opened) {
         output.write(`Browser open failed: ${result.reason ?? "unknown error"}\nOpen the fallback URL manually.\n`);
       }
     }
 
     const callbackUrl = await receiver.waitForCallback(options.abortSignal, options.timeoutMs);
-    parseZaiOAuthCallback(callbackUrl, state);
+    const parsed = parseZaiOAuthCallbackInput(callbackUrl, state);
     await dispose();
     output.write("Authorization received. Completing official ZCode setup...\n");
-    return await options.completeLogin({ callbackUrl, state }, options.invocation.runtimeArgs);
+    return await options.completeLogin(
+      { callbackUrl: parsed.callbackUrl, state },
+      options.invocation.runtimeArgs
+    );
   } finally {
     await dispose();
   }

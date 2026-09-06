@@ -80,8 +80,8 @@ Node.js npm launcher (config / login / version metadata)
 
 The official agent, model, session, tool, plugin, MCP, credential store and
 provider-configuration logic remains in the extracted runtime. The local
-package supplies the missing terminal interface and a narrow macOS callback
-bridge for Z.AI's registered Desktop OAuth flow. Node.js starts the public npm
+package supplies the missing terminal interface and a callback bridge for
+Z.AI's registered Desktop OAuth flow. Node.js starts the public npm
 command and remains the compatibility host for the extracted upstream kernel.
 The official runtime directly owns raw terminal mode, IME cursor placement and
 resize handling; the launcher does not insert a second PTY or relay terminal
@@ -391,9 +391,11 @@ browser for interactive login or verification flows.
 - Node.js 22.19 or newer;
 - macOS, Linux or Windows on x64 or ARM64.
 
-Z.AI browser OAuth currently requires macOS because the registered provider
-callback is `zcode://zai-auth/callback`; API-key and custom-provider access work
-on every supported platform.
+Z.AI browser OAuth uses the registered `zcode://zai-auth/callback` redirect on
+every supported platform. macOS captures that callback automatically; Linux and
+Windows start a localhost listener plus a paste fallback so login can finish
+without the ZCode desktop app. API-key and custom-provider access also work on
+every supported platform.
 
 Set `ZCODE_NODE=/absolute/path/to/node` when the desired Node.js executable is
 not available on `PATH`.
@@ -405,7 +407,7 @@ ZCode reads configuration from `~/.zcode/cli/config.json` (or
 overrides from `zcode.json` or `.zcode/config.json` in the working directory.
 Existing files are never replaced.
 
-Three model-access paths are supported: Z.AI OAuth (macOS only), Z.AI/BigModel
+Three model-access paths are supported: Z.AI OAuth, Z.AI/BigModel
 Coding Plan API key, or a direct API key with a custom provider. For detailed
 setup steps, retries/timeouts, theme, and turn-completion notifications, see
 [Configuration](./docs/CONFIGURATION.md).

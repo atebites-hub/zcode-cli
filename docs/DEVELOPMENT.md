@@ -62,9 +62,12 @@ To print the authorization URL without launching the browser:
 bun bin/zcode.ts login --oauth --no-browser
 ```
 
-The URL must still be opened on the same Mac so its `zcode://` callback reaches
-the waiting CLI. Cross-device SSH login is not supported by this provider flow;
-use the masked Z.AI Coding Plan API-key option instead. The wrapper no longer
+Open the printed URL in a browser, then return to the waiting CLI. On macOS the
+`zcode://` callback is captured automatically. On Linux and Windows the CLI
+listens on localhost for the same registered callback and also accepts a pasted
+`zcode://` URL (or authorization code) if the browser cannot hand it back.
+Cross-device SSH login works by pasting that callback URL into the remote
+session; do not fall back to API-key paste for this flow. The wrapper no longer
 uses the upstream `oauth/cli/init` polling endpoint, which currently returns
 HTTP 404.
 

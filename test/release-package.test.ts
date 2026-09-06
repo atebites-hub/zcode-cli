@@ -152,6 +152,7 @@ describe("release package", () => {
       "src/app-server-client.ts": "export {};\n",
       "src/command.ts": "export {};\n",
       "src/darwin-oauth-callback.ts": "export {};\n",
+      "src/portable-oauth-callback.ts": "export {};\n",
       "src/launcher.ts": "export {};\n",
       "src/model-access.ts": "export {};\n",
       "src/plugin-cli.ts": "export {};\n",
