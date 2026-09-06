@@ -85,6 +85,7 @@ export async function validatePackageTree(base = root): Promise<void> {
     "src/app-server-client.ts",
     "src/command.ts",
     "src/darwin-oauth-callback.ts",
+    "src/portable-oauth-callback.ts",
     "src/launcher.ts",
     "src/model-access.ts",
     "src/plugin-cli.ts",

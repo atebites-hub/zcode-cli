@@ -74,9 +74,11 @@ existing CLI-side `apiKey` for the same provider is always preserved.
 
 Three model-access paths are supported:
 
-- **Z.AI OAuth on macOS**: run `zcode login` when no provider is configured, or
+- **Z.AI OAuth**: run `zcode login` when no provider is configured, or
   `zcode login --oauth` to force reauthorization; add `--no-browser` to print
-  the authorization URL instead of opening a browser (useful over SSH);
+  the authorization URL instead of opening a browser (useful over SSH). On
+  Linux and Windows, paste the `zcode://` callback URL if the browser cannot
+  hand it back automatically;
 - **Z.AI/BigModel Coding Plan API key**: open `/login` in the TUI and choose the
   matching masked API-key option;
 - **Direct API key with a custom provider**: use the
@@ -105,18 +107,22 @@ The same picker includes a **Custom provider** entry that points to the
 configuration-template path below. Custom providers do not use OAuth.
 
 Selecting **Z.AI Coding Plan** releases TUI raw mode and starts the registered
-Desktop authorization-code flow. On macOS the CLI temporarily installs a
-background-only callback receiver, verifies the returned `state`, restores the
-previous `zcode://` handler, and hands the callback to the official runtime.
-The authorization code travels over stdin instead of command-line arguments or
-environment variables. The runtime performs token exchange, encrypted
-credential persistence, Coding Plan API-key resolution and `config.json`
-updates. The TUI is then restored and the model configuration is re-read.
+Desktop authorization-code flow. The CLI verifies the returned `state` and
+hands the callback to the official runtime. On macOS it temporarily installs a
+background-only `zcode://` receiver and restores the previous handler. On
+Linux it also binds a localhost HTTP capture endpoint and, when `xdg-mime` is
+available, a temporary `zcode://` desktop handler that posts the callback back
+to that listener. If the browser cannot open `zcode://`, paste the full
+callback URL from the address bar into the waiting CLI. The authorization code
+travels over stdin instead of command-line arguments or environment variables.
+The runtime performs token exchange, encrypted credential persistence, Coding
+Plan API-key resolution and `config.json` updates. The TUI is then restored
+and the model configuration is re-read.
 
-The callback receiver is removed after success, cancellation or timeout. A
-small recovery record lets the next login restore the previous handler after
-an unclean process exit. The BigModel option continues to use the official
-localhost-callback implementation inside the runtime.
+The callback receiver is removed after success, cancellation or timeout. On
+macOS a small recovery record lets the next login restore the previous handler
+after an unclean process exit. The BigModel option continues to use the
+official localhost-callback implementation inside the runtime.
 
 ### Custom provider without login
 
