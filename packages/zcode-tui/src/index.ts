@@ -4,6 +4,7 @@ import { constants as osConstants } from "node:os";
 import { basename } from "node:path";
 
 import { cliAuthUnlockLabel, syncCliAuthFromDesktop } from "../../../src/cli-auth-sync.ts";
+import { planFirstRunTuiStart } from "../../../src/first-run-setup.ts";
 import { ensureCodingPlanAccess } from "../../../src/prompt-preflight.ts";
 import { preflightSubmission } from "./prompt-preflight.ts";
 import {
@@ -870,19 +871,46 @@ class ZCodeTui {
         if (this.firstRunSkipRequested) {
           await this.dismissFirstRunSetup();
         } else {
-          await syncCliAuthFromDesktop().catch(() => undefined);
-          if (await readConfiguredModelAccess().catch(() => null)) {
-            // The user already configured model access outside the wizard (for
-            // example via `zcode login`, desktop OAuth tokens, or a hand-edited
-            // config.json); honor that as completed setup instead of showing the
-            // wizard again.
-            this.firstRunSetupArmed = false;
-            await clearSetupPending().catch(() => {});
-            this.setLoginRequired(false);
-          } else if (this.firstRunSkipRequested) {
-            await this.dismissFirstRunSetup();
-          } else {
-            void this.runFirstRunSetup();
+          const firstRun = await planFirstRunTuiStart().catch(() => ({ action: "idle" as const }));
+          switch (firstRun.action) {
+            case "idle":
+              this.firstRunSetupArmed = false;
+              break;
+            case "complete-setup":
+              // The user already configured model access outside the wizard (for
+              // example via `zcode login` or a hand-edited config.json); honor that
+              // as completed setup instead of showing the wizard again.
+              this.firstRunSetupArmed = false;
+              await clearSetupPending().catch(() => {});
+              this.setLoginRequired(false);
+              break;
+            case "open-wizard":
+              // Do not await desktop OAuth mapping unless desktop files exist.
+              // Smoke sends Esc as soon as the header is visible; #5 still
+              // honors that skip if it arrived before showChoice is armed.
+              if (firstRun.hydrateDesktopAuth) {
+                await syncCliAuthFromDesktop().catch(() => undefined);
+                if (this.firstRunSkipRequested) {
+                  await this.dismissFirstRunSetup();
+                  break;
+                }
+                if (await readConfiguredModelAccess().catch(() => null)) {
+                  this.firstRunSetupArmed = false;
+                  await clearSetupPending().catch(() => {});
+                  this.setLoginRequired(false);
+                  break;
+                }
+              }
+              if (this.firstRunSkipRequested) {
+                await this.dismissFirstRunSetup();
+              } else {
+                void this.runFirstRunSetup();
+              }
+              break;
+            default: {
+              const _exhaustive: never = firstRun;
+              throw new Error(`Unhandled first-run plan: ${JSON.stringify(_exhaustive)}`);
+            }
           }
         }
       }
