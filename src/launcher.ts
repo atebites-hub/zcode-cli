@@ -31,6 +31,7 @@ import {
 import { requestAppServer } from "./app-server-client.ts";
 import { runPluginCommand } from "./plugin-cli.ts";
 import { missingCodingPlanKey } from "./prompt-preflight.ts";
+import { hydrateZaiCodingPlanAccess } from "./zai-credentials.ts";
 import {
   capabilitiesFromExtractionMetadata,
   type RuntimeCliOptionType
@@ -260,13 +261,29 @@ function inspectRuntimeInvocation(
 }
 
 export async function promptPreflight(
-  args: string[], env: NodeJS.ProcessEnv = process.env
+  args: string[],
+  env: NodeJS.ProcessEnv = process.env,
+  options: {
+    hydrateAccess?: typeof hydrateZaiCodingPlanAccess;
+  } = {}
 ): Promise<string | undefined> {
   const invocation = inspectRuntimeInvocation(args, readRuntimeCliOptionTypes());
   if (!invocation.agentInvocation || invocation.invalid || invocation.passthrough || invocation.resume) {
     return undefined;
   }
-  return missingCodingPlanKey({ env, workingDirectory: invocation.workingDirectory });
+  const diagnostic = await missingCodingPlanKey({ env, workingDirectory: invocation.workingDirectory });
+  if (!diagnostic) return undefined;
+  try {
+    const access = await (options.hydrateAccess ?? hydrateZaiCodingPlanAccess)({ env });
+    if (access) return undefined;
+  } catch (error) {
+    console.error(
+      `Unable to reuse existing Z.AI OAuth credentials: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
+  }
+  return diagnostic;
 }
 
 export function withDefaultBrowserUse(
@@ -951,12 +968,29 @@ export async function main(args: string[]): Promise<number> {
   const login = normalizeLoginArgs(args);
   const zaiOAuth = classifyZaiOAuthInvocation(args);
   if (login.checkConfiguredAccess) {
-    const access = await readConfiguredModelAccess();
+    let access = await readConfiguredModelAccess();
+    let reusedOAuth = false;
+    if (!access) {
+      try {
+        access = await hydrateZaiCodingPlanAccess();
+        reusedOAuth = Boolean(access);
+      } catch (error) {
+        console.error(
+          `Unable to reuse existing Z.AI OAuth credentials: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
+      }
+    }
     if (access) {
+      if (reusedOAuth) await clearSetupPending();
       console.log(
-        `Model access is already configured for ${access.model}; OAuth login is not required.\n`
-        + `Config: ${access.configPath}\n`
-        + "Run `zcode login --oauth` to force Z.AI OAuth."
+        reusedOAuth
+          ? `Model access configured for ${access.model} from existing Z.AI OAuth credentials.\n`
+            + `Config: ${access.configPath}`
+          : `Model access is already configured for ${access.model}; OAuth login is not required.\n`
+            + `Config: ${access.configPath}\n`
+            + "Run `zcode login --oauth` to force Z.AI OAuth."
       );
       return 0;
     }

@@ -18,6 +18,7 @@ import {
   detectDesktopInstallation,
   type DesktopInstallation
 } from "../../../src/desktop-migration.ts";
+import { hydrateZaiCodingPlanAccess } from "../../../src/zai-credentials.ts";
 import {
   availableUpdateVersion,
   readStartupUpdate,
@@ -853,10 +854,14 @@ class ZCodeTui {
       if (!this.loginRequired) void this.refreshGoal();
       if (!this.loginRequired) void this.refreshSessionUsage();
       if (await readSetupPending().catch(() => false)) {
-        if (await readConfiguredModelAccess().catch(() => null)) {
+        const access = await readConfiguredModelAccess().catch(() => null)
+          ?? await hydrateZaiCodingPlanAccess().catch(() => null);
+        if (access) {
           // The user already configured model access outside the wizard (for
-          // example via `zcode login` or a hand-edited config.json); honor that
-          // as completed setup instead of showing the wizard again.
+          // example via `zcode login`, existing OAuth credentials, or a
+          // hand-edited config.json); honor that as completed setup instead of
+          // showing the wizard again.
+          this.setLoginRequired(false);
           await clearSetupPending().catch(() => {});
         } else {
           void this.runFirstRunSetup();
@@ -4080,7 +4085,21 @@ class ZCodeTui {
     } catch {
       desktop = null;
     }
-    const access = await readConfiguredModelAccess().catch(() => null);
+    let access = await readConfiguredModelAccess().catch(() => null);
+    if (!access) {
+      try {
+        access = await hydrateZaiCodingPlanAccess();
+        if (access && !manual) {
+          this.setLoginRequired(false);
+          await clearSetupPending().catch(() => {});
+          this.addNotice("Setup complete · reused existing Z.AI OAuth credentials.", "muted");
+          return;
+        }
+        if (access) this.setLoginRequired(false);
+      } catch {
+        access = null;
+      }
+    }
     const statusHint = access
       ? `Model access is already configured (${access.model}).`
       : "Model access is not configured yet.";
@@ -4092,7 +4111,7 @@ class ZCodeTui {
         items.push({
           value: "import-desktop",
           label: "Import settings from ZCode desktop",
-          description: `Copy desktop ${families} providers and model choices${desktop.plan.defaultFamily ? ` (selected: ${desktop.plan.defaultFamily})` : ""} · credentials are not copied`
+          description: `Copy desktop ${families} providers and model choices${desktop.plan.defaultFamily ? ` (selected: ${desktop.plan.defaultFamily})` : ""} · existing OAuth sign-in is reused when available`
         });
       }
       items.push(
@@ -4182,7 +4201,7 @@ class ZCodeTui {
         + "into your CLI config? A backup of the current config is saved first.",
       help: "Enter import · Esc cancel",
       items: [
-        { value: "import", label: `Import ${family} settings`, description: "Provider, baseURL and model list · no credentials" },
+        { value: "import", label: `Import ${family} settings`, description: "Provider, baseURL and model list · OAuth tokens are reused when possible" },
         { value: "cancel", label: "Cancel", description: "Keep the current CLI configuration" }
       ]
     });
@@ -4199,10 +4218,27 @@ class ZCodeTui {
       return false;
     }
 
+    try {
+      const hydrated = await hydrateZaiCodingPlanAccess();
+      if (hydrated) {
+        this.setLoginRequired(false);
+        await clearSetupPending().catch(() => {});
+        this.addNotice(`Reused existing Z.AI OAuth credentials for ${hydrated.model}.`, "muted");
+        return false;
+      }
+    } catch (error) {
+      this.addNotice(
+        `Imported settings, but existing OAuth credentials could not be used: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+        "warning"
+      );
+    }
+
     const signIn = await this.showChoice({
       title: "Sign in to finish",
       prompt:
-        `Desktop credentials cannot be copied. Sign in with the ${family} Coding Plan now to complete setup?`,
+        `Desktop API keys are not copied. Sign in with the ${family} Coding Plan now to complete setup?`,
       help: "Enter select · Esc decide later",
       items: [
         { value: "now", label: "Sign in now (recommended)", description: "Opens the Coding Plan login picker" },

@@ -30,7 +30,7 @@ On first launch, ZCode creates `~/.zcode/cli/config.json` (or
 defaults and opens a setup wizard in the TUI. It guides you through the three
 model-access paths in [Configuration](./docs/CONFIGURATION.md), and when the
 ZCode desktop app is installed it can import the desktop provider settings
-(credentials stay behind a fresh sign-in, like a browser profile import).
+(existing desktop OAuth credentials are reused when they can be decrypted).
 Reopen it anytime with `/setup`; press Esc to skip.
 
 ## Table of contents
@@ -391,9 +391,10 @@ browser for interactive login or verification flows.
 - Node.js 22.19 or newer;
 - macOS, Linux or Windows on x64 or ARM64.
 
-Z.AI browser OAuth currently requires macOS because the registered provider
-callback is `zcode://zai-auth/callback`; API-key and custom-provider access work
-on every supported platform.
+Z.AI OAuth works on macOS via a native `zcode://` callback, and on Linux or
+Windows by pasting that same callback URL after the browser redirect. If
+`~/.zcode/v2/credentials.json` already has a Z.AI access token, the CLI
+reuses it and writes a Coding Plan API key — no pasted key required.
 
 Set `ZCODE_NODE=/absolute/path/to/node` when the desired Node.js executable is
 not available on `PATH`.
@@ -405,7 +406,7 @@ ZCode reads configuration from `~/.zcode/cli/config.json` (or
 overrides from `zcode.json` or `.zcode/config.json` in the working directory.
 Existing files are never replaced.
 
-Three model-access paths are supported: Z.AI OAuth (macOS only), Z.AI/BigModel
+Three model-access paths are supported: Z.AI OAuth, Z.AI/BigModel
 Coding Plan API key, or a direct API key with a custom provider. For detailed
 setup steps, retries/timeouts, theme, and turn-completion notifications, see
 [Configuration](./docs/CONFIGURATION.md).

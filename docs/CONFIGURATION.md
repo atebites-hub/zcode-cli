@@ -12,8 +12,11 @@ Headless commands exit unsuccessfully with setup instructions.
 This is deliberately not a general credentials validator. Custom endpoints,
 environment authentication/model overrides, ancestor project configurations,
 dotenv files, and resumed headless sessions remain the runtime's responsibility.
-Login, setup, help, and other management commands remain available. No credentials
-are printed, changed, or tested over the network by this check.
+Login, setup, help, and other management commands remain available. The check
+itself does not print credentials. When a keyless Coding Plan config is paired
+with an existing Z.AI OAuth access token in `~/.zcode/v2/credentials.json`, the
+launcher performs a one-shot Coding Plan API-key resolution and writes
+`provider.zai.options.apiKey` so the prompt can proceed.
 
 This document covers the detailed model-access configuration for
 zcode-app-cli. For installation and basic usage, see the
@@ -64,19 +67,24 @@ exist after the import. A backup of the pre-import `config.json` is written
 next to it as `config.json.pre-migration.bak`; if the backup cannot be
 written, the import is aborted before any change is made.
 
-Desktop credentials are never copied: the desktop app stores them encrypted
-(`enc:v1:`) with a key held by the desktop process, and the CLI reads desktop
-files only. After importing, sign in once via the offered login step (or
-`/login` later) so a fresh Coding Plan API key lands in the CLI config. An
-existing CLI-side `apiKey` for the same provider is always preserved.
+Desktop API keys are not copied out of provider options. Shared OAuth tokens in
+`~/.zcode/v2/credentials.json` are encrypted (`enc:v1:`) with `ZCODE_CREDENTIAL_SECRET`
+or a machine-local fallback. After import — and on ordinary `zcode` / `zcode -p`
+startup — the CLI decrypts a Z.AI access token when possible, resolves the
+`zcode-api-key` Coding Plan key, and writes it to `provider.zai.options.apiKey`.
+If that reuse fails, the setup wizard offers a one-shot sign-in. An existing
+CLI-side `apiKey` for the same provider is always preserved.
 
 ## Model-access paths
 
 Three model-access paths are supported:
 
-- **Z.AI OAuth on macOS**: run `zcode login` when no provider is configured, or
+- **Z.AI OAuth**: run `zcode login` when no provider is configured, or
   `zcode login --oauth` to force reauthorization; add `--no-browser` to print
-  the authorization URL instead of opening a browser (useful over SSH);
+  the authorization URL instead of opening a browser (useful over SSH). On
+  Linux and Windows, paste the `zcode://` callback URL after the browser
+  redirect. Existing tokens in `~/.zcode/v2/credentials.json` are reused
+  automatically;
 - **Z.AI/BigModel Coding Plan API key**: open `/login` in the TUI and choose the
   matching masked API-key option;
 - **Direct API key with a custom provider**: use the
@@ -108,6 +116,8 @@ Selecting **Z.AI Coding Plan** releases TUI raw mode and starts the registered
 Desktop authorization-code flow. On macOS the CLI temporarily installs a
 background-only callback receiver, verifies the returned `state`, restores the
 previous `zcode://` handler, and hands the callback to the official runtime.
+On Linux and Windows the same authorize URL is used; after the browser
+redirects to `zcode://zai-auth/callback`, paste that URL into the waiting CLI.
 The authorization code travels over stdin instead of command-line arguments or
 environment variables. The runtime performs token exchange, encrypted
 credential persistence, Coding Plan API-key resolution and `config.json`

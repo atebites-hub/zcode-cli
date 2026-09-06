@@ -89,6 +89,7 @@ export async function validatePackageTree(base = root): Promise<void> {
     "src/model-access.ts",
     "src/plugin-cli.ts",
     "src/plugin-protocol.ts",
+    "src/zai-credentials.ts",
     "src/zai-oauth.ts",
     "tsdown.config.ts",
     "vendor/extraction.json",

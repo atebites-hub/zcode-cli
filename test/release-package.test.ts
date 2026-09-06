@@ -156,6 +156,7 @@ describe("release package", () => {
       "src/model-access.ts": "export {};\n",
       "src/plugin-cli.ts": "export {};\n",
       "src/plugin-protocol.ts": "export {};\n",
+      "src/zai-credentials.ts": "export {};\n",
       "src/zai-oauth.ts": "export {};\n",
       "tsdown.config.ts": "export default [];\n",
       "packages/zcode-tui/dist/index.js": "export const value = 1;\n",

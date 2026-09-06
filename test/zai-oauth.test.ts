@@ -108,11 +108,40 @@ describe("Z.AI Desktop OAuth bridge", () => {
     expect(output).toContain("Open this URL to sign in");
   });
 
-  test("fails clearly on platforms that cannot receive the registered callback", async () => {
-    expect(runZaiOAuthLogin({
-      completeLogin: async () => 0,
-      invocation: { json: false, noBrowser: false, runtimeArgs: ["login"] },
-      platform: "linux"
-    })).rejects.toThrow(/requires macOS/);
+  test("completes Linux login by pasting the zcode:// callback URL", async () => {
+    const callbackUrl = "zcode://zai-auth/callback?code=linux-code&state=expected-state";
+    let output = "";
+    const events: string[] = [];
+    const code = await runZaiOAuthLogin({
+      completeLogin: async (payload, runtimeArgs) => {
+        events.push("complete");
+        expect(payload).toEqual({ callbackUrl, state: "expected-state" });
+        expect(runtimeArgs).toEqual(["login", "--no-browser"]);
+        return 0;
+      },
+      invocation: {
+        json: false,
+        noBrowser: true,
+        runtimeArgs: ["login", "--no-browser"]
+      },
+      openBrowser: async () => {
+        throw new Error("browser opener should not run");
+      },
+      output: { write(value) { output += value; } },
+      platform: "linux",
+      readCallbackLine: async () => {
+        events.push("paste");
+        return callbackUrl;
+      },
+      state: "expected-state"
+    });
+
+    expect(code).toBe(0);
+    expect(events).toEqual(["paste", "complete"]);
+    expect(output).toContain("Open this URL to sign in");
+    expect(output).toContain("paste that callback URL");
+    expect(output).toContain("Authorization received");
+    expect(output).not.toContain("linux-code");
+    expect(output).not.toContain("requires macOS");
   });
 });

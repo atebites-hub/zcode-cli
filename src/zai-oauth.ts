@@ -1,4 +1,6 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
+import { stdin } from "node:process";
+import { createInterface } from "node:readline/promises";
 
 import {
   createDarwinUrlCallbackReceiver,
@@ -49,6 +51,7 @@ export interface ZaiOAuthLoginOptions {
   openBrowser?: (url: string) => Promise<BrowserOpenResult>;
   output?: WritableOutput;
   platform?: NodeJS.Platform;
+  readCallbackLine?: () => Promise<string>;
   state?: string;
   timeoutMs?: number;
 }
@@ -112,28 +115,98 @@ export function parseZaiOAuthCallback(callbackUrl: string, expectedState: string
   return { callbackUrl, code, state };
 }
 
-async function openBrowser(url: string): Promise<BrowserOpenResult> {
-  const result = await captureCommand("/usr/bin/open", [url]);
+function browserOpenCommand(platform: NodeJS.Platform): string | undefined {
+  if (platform === "darwin") return "/usr/bin/open";
+  if (platform === "linux") return "xdg-open";
+  return undefined;
+}
+
+async function openBrowser(url: string, platform: NodeJS.Platform): Promise<BrowserOpenResult> {
+  const command = browserOpenCommand(platform);
+  if (!command) {
+    return { opened: false, reason: `no browser opener for ${platform}` };
+  }
+  const result = await captureCommand(command, [url]);
   return result.code === 0
     ? { opened: true }
-    : { opened: false, reason: result.stderr.trim() || `open exited with status ${result.code}` };
+    : { opened: false, reason: result.stderr.trim() || `${command} exited with status ${result.code}` };
+}
+
+export async function readCallbackLineFromStdin(): Promise<string> {
+  const rl = createInterface({ crlfDelay: Infinity, input: stdin });
+  try {
+    return await new Promise<string>((resolve, reject) => {
+      const succeed = (line: string) => {
+        rl.off("close", onClose);
+        resolve(line);
+      };
+      const onClose = () => {
+        reject(new Error("Stdin closed before a zcode:// callback URL was provided."));
+      };
+      rl.once("line", succeed);
+      rl.once("close", onClose);
+    });
+  } finally {
+    rl.close();
+  }
+}
+
+export async function waitForPastedCallbackUrl(options: {
+  readLine: () => Promise<string>;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+}): Promise<string> {
+  const timeoutMs = options.timeoutMs ?? 5 * 60_000;
+  const read = options.readLine();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<string>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error("Timed out waiting for the zcode:// callback URL.")),
+      timeoutMs
+    );
+    timer.unref?.();
+  });
+  const abort = options.signal
+    ? new Promise<string>((_, reject) => {
+      const onAbort = () => reject(options.signal?.reason ?? new Error("Login cancelled."));
+      if (options.signal?.aborted) {
+        onAbort();
+        return;
+      }
+      options.signal?.addEventListener("abort", onAbort, { once: true });
+    })
+    : undefined;
+  try {
+    const line = await Promise.race([read, timeout, ...(abort ? [abort] : [])]);
+    const trimmed = line.trim();
+    if (!trimmed) throw new Error("A zcode:// callback URL is required to finish login.");
+    return trimmed;
+  } finally {
+    if (timer) clearTimeout(timer);
+    read.catch(() => {});
+  }
+}
+
+function createStdinCallbackReceiver(
+  readLine: () => Promise<string>
+): DarwinUrlCallbackReceiver {
+  return {
+    async dispose() {},
+    async waitForCallback(signal, timeoutMs) {
+      return await waitForPastedCallbackUrl({ readLine, signal, timeoutMs });
+    }
+  };
 }
 
 export async function runZaiOAuthLogin(options: ZaiOAuthLoginOptions): Promise<number> {
   const platform = options.platform ?? process.platform;
-  if (platform !== "darwin") {
-    throw new Error(
-      "Z.AI browser login requires macOS for the registered zcode:// callback. "
-      + "Use the Z.AI Coding Plan API Key option in /login on this platform."
-    );
-  }
-
+  const nativeCallback = platform === "darwin";
   const env = options.env ?? process.env;
   const state = options.state ?? randomBytes(32).toString("hex");
   const output = options.output ?? process.stdout;
-  const createReceiver = options.createReceiver ?? ((receiverOptions) => (
-    createDarwinUrlCallbackReceiver(receiverOptions)
-  ));
+  const createReceiver = options.createReceiver ?? (nativeCallback
+    ? (receiverOptions) => createDarwinUrlCallbackReceiver(receiverOptions)
+    : async () => createStdinCallbackReceiver(options.readCallbackLine ?? readCallbackLineFromStdin));
   const receiver = await createReceiver({ env, scheme: "zcode" });
   let disposed = false;
   const dispose = async () => {
@@ -144,13 +217,24 @@ export async function runZaiOAuthLogin(options: ZaiOAuthLoginOptions): Promise<n
 
   try {
     const authorizeUrl = buildZaiAuthorizeUrl(state);
-    if (options.invocation.noBrowser) {
-      output.write(`Open this URL to sign in:\n${authorizeUrl}\nWaiting for the zcode:// callback...\n`);
+    if (options.invocation.noBrowser || !nativeCallback) {
+      output.write(`Open this URL to sign in:\n${authorizeUrl}\n`);
+      output.write(
+        nativeCallback
+          ? "Waiting for the zcode:// callback...\n"
+          : "After the browser redirects to a zcode:// URL, paste that callback URL here and press Enter.\n"
+            + "Waiting for the zcode:// callback URL...\n"
+      );
     } else {
       output.write(`Opening browser for Z.AI authorization.\nFallback URL:\n${authorizeUrl}\n`);
-      const result = await (options.openBrowser ?? openBrowser)(authorizeUrl);
+    }
+    if (!options.invocation.noBrowser) {
+      const result = await (options.openBrowser ?? ((url) => openBrowser(url, platform)))(authorizeUrl);
       if (!result.opened) {
-        output.write(`Browser open failed: ${result.reason ?? "unknown error"}\nOpen the fallback URL manually.\n`);
+        output.write(
+          `Browser open failed: ${result.reason ?? "unknown error"}\n`
+          + (nativeCallback ? "Open the fallback URL manually.\n" : "Open the sign-in URL in a browser, then paste the zcode:// callback URL.\n")
+        );
       }
     }
 
