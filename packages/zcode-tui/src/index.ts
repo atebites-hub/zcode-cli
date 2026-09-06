@@ -181,6 +181,12 @@ import {
   type RuntimePollState
 } from "./runtime-poll.ts";
 import {
+  classifySetupLoginCommand,
+  decideSetupAfterLogin,
+  isCodingPlanLoginPickerCommand,
+  type SetupLoginInteraction
+} from "./login-setup.ts";
+import {
   parseSelectionCommand,
   protectSubmission,
   redactSecrets,
@@ -692,6 +698,7 @@ class ZCodeTui {
   private backgroundHandoffInterruptInFlight = false;
   private updateCheckAbortController?: AbortController;
   private loginRequired: boolean;
+  private setupLoginInteraction?: SetupLoginInteraction;
   private removeStreamErrorGuards?: () => void;
 
   constructor(private readonly options: TuiOptions) {
@@ -1236,7 +1243,31 @@ class ZCodeTui {
     }
   }
 
+  private noteSetupLoginInteraction(interaction: SetupLoginInteraction): void {
+    if (!this.setupLoginInteraction) return;
+    this.setupLoginInteraction = interaction;
+  }
+
+  private restoreInteractiveTerminal(): void {
+    if (this.stopped) return;
+    this.updateActivity(undefined);
+    this.focusEditor();
+    this.ui.requestRender(true);
+  }
+
+  private async completeConfiguredSetup(access: { configPath: string; model: string }): Promise<void> {
+    await clearSetupPending().catch(() => {});
+    this.model = access.model;
+    this.setLoginRequired(false);
+    this.addNotice("Setup complete · model access is configured.", "muted");
+    this.restoreInteractiveTerminal();
+  }
+
   private async runSuspendedLogin(displayInput: string, overrideCommand?: string): Promise<void> {
+    this.noteSetupLoginInteraction({
+      kind: "method-started",
+      method: overrideCommand ? "other" : "oauth"
+    });
     this.transcript.clearSearch();
     this.transcript.clearCursor();
     this.addUserMessage(displayInput);
@@ -1304,7 +1335,9 @@ class ZCodeTui {
     if (access) {
       this.model = access.model;
       this.setLoginRequired(false);
+      await clearSetupPending().catch(() => {});
       this.addNotice(`Model access configured via ${access.configPath}.`, "muted");
+      this.restoreInteractiveTerminal();
     } else if (failure) {
       this.addNotice(`Login command failed: ${failure}`, "error");
     } else if (code !== 0) {
@@ -2117,11 +2150,14 @@ class ZCodeTui {
     }
     if (typeof result.loginRequired === "boolean") {
       this.setLoginRequired(result.loginRequired);
-      if (!result.loginRequired
-        && result.model === undefined
-        && appliesToSetting(settingTarget, "model")) {
-        const access = await readConfiguredModelAccess();
-        if (access) this.model = access.model;
+      if (!result.loginRequired) {
+        const access = await readConfiguredModelAccess().catch(() => null);
+        if (access) {
+          await clearSetupPending().catch(() => {});
+          if (result.model === undefined && appliesToSetting(settingTarget, "model")) {
+            this.model = access.model;
+          }
+        }
       }
     }
     if (appliesToSetting(settingTarget, "effort") && typeof result.thoughtLevel === "string") {
@@ -3551,7 +3587,8 @@ class ZCodeTui {
       const parsed = parseSelectionCommand(item, index);
       return parsed ? [parsed] : [];
     });
-    if (commands.some((command) => /^\/login\s+(?:zai|bigmodel)-/u.test(command.command))) {
+    const loginPicker = commands.some((command) => isCodingPlanLoginPickerCommand(command.command));
+    if (loginPicker) {
       commands.push({
         command: customProviderHelpCommand,
         description: "Configure any supported endpoint in config.json without signing in",
@@ -3573,8 +3610,12 @@ class ZCodeTui {
         selectedIndex: typeof selection.selectedIndex === "number" ? selection.selectedIndex : 0
       });
       const command = selected?.payload as SelectionCommand | undefined;
-      if (!command?.command) return;
+      if (!command?.command) {
+        if (loginPicker) this.noteSetupLoginInteraction({ kind: "picker-cancelled" });
+        return;
+      }
       if (command.command === customProviderHelpCommand) {
+        if (loginPicker) this.noteSetupLoginInteraction({ kind: "custom-help" });
         const configPath = userConfigPathHint();
         this.addNotice(
           `Custom providers do not require login. Copy config.example.json to ${configPath}, `
@@ -3583,6 +3624,10 @@ class ZCodeTui {
           "muted"
         );
         return;
+      }
+      const loginMethod = classifySetupLoginCommand(command.command);
+      if (loginMethod) {
+        this.noteSetupLoginInteraction({ kind: "method-started", method: loginMethod });
       }
       if (!command.input) {
         const submission = selectionSubmission(command) ?? undefined;
@@ -4084,12 +4129,17 @@ class ZCodeTui {
     } catch {
       desktop = null;
     }
-    const access = await readConfiguredModelAccess().catch(() => null);
-    const statusHint = access
-      ? `Model access is already configured (${access.model}).`
-      : "Model access is not configured yet.";
 
     while (!this.stopped) {
+      const access = await readConfiguredModelAccess().catch(() => null);
+      if (access && !manual) {
+        await this.completeConfiguredSetup(access);
+        return;
+      }
+      const statusHint = access
+        ? `Model access is already configured (${access.model}).`
+        : "Model access is not configured yet.";
+
       const items: ChoiceItem[] = [];
       if (desktop) {
         const families = desktop.plan.families.map((entry) => entry.family).join("/");
@@ -4125,9 +4175,10 @@ class ZCodeTui {
       });
       if (!selected || selected.value === "skip") {
         await clearSetupPending().catch(() => {});
-        if (!manual && !access) {
+        if (!manual) {
           this.addNotice("Setup skipped · run /login or /setup anytime.", "muted");
         }
+        this.restoreInteractiveTerminal();
         return;
       }
 
@@ -4140,32 +4191,41 @@ class ZCodeTui {
           + "See README: Custom provider without login.",
           "muted"
         );
+        this.restoreInteractiveTerminal();
         return;
       }
 
       if (selected.value === "import-desktop" && desktop) {
         const imported = await this.importDesktopSettings(desktop);
         if (!imported) continue; // Esc or deferred — back to method selection
+        const importedAccess = await readConfiguredModelAccess().catch(() => null);
+        if (importedAccess) {
+          await this.completeConfiguredSetup(importedAccess);
+          return;
+        }
       }
 
-      const importedAccess = selected.value === "import-desktop"
-        ? await readConfiguredModelAccess().catch(() => null)
-        : null;
-      if (selected.value === "sign-in" || (selected.value === "import-desktop" && !importedAccess)) {
+      if (selected.value === "sign-in" || selected.value === "import-desktop") {
+        this.setupLoginInteraction = { kind: "opened" };
         await this.submit("/login");
+        const finalAccess = await readConfiguredModelAccess().catch(() => null);
+        const decision = decideSetupAfterLogin({
+          access: finalAccess,
+          interaction: this.setupLoginInteraction ?? { kind: "opened" },
+          manual
+        });
+        this.setupLoginInteraction = undefined;
+        if (decision.action === "complete" && finalAccess) {
+          await this.completeConfiguredSetup(finalAccess);
+          return;
+        }
+        if (decision.notice) this.addNotice(decision.notice.text, decision.notice.tone);
+        if (decision.clearPending) await clearSetupPending().catch(() => {});
+        if (decision.action === "leave") {
+          this.restoreInteractiveTerminal();
+          return;
+        }
       }
-
-      const finalAccess = await readConfiguredModelAccess().catch(() => null);
-      if (finalAccess) {
-        await clearSetupPending().catch(() => {});
-        this.setLoginRequired(false);
-        this.addNotice("Setup complete · model access is configured.", "muted");
-        return;
-      }
-      // Login was attempted but did not produce model access. Loop back to
-      // the method selection so the user can try a different approach instead
-      // of being dropped out of the wizard.
-      this.addNotice("Login did not produce model access · choose another method or skip.", "muted");
     }
   }
 
