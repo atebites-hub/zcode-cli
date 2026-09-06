@@ -29,9 +29,11 @@ On first launch, ZCode creates `~/.zcode/cli/config.json` (or
 `%USERPROFILE%\.zcode\cli\config.json` on Windows) with credential-free
 defaults and opens a setup wizard in the TUI. It guides you through the three
 model-access paths in [Configuration](./docs/CONFIGURATION.md), and when the
-ZCode desktop app is installed it can import the desktop provider settings
-(credentials stay behind a fresh sign-in, like a browser profile import).
-Reopen it anytime with `/setup`; press Esc to skip.
+ZCode desktop app is installed it can import the desktop provider settings.
+After a Desktop login, Import (or the next `zcode -p`) maps existing
+`~/.zcode/v2/credentials.json` OAuth tokens onto
+`provider.zai.options.apiKey` so the CLI can prompt without a separate key
+paste. Reopen setup anytime with `/setup`; press Esc to skip.
 
 ## Table of contents
 
@@ -394,7 +396,9 @@ browser for interactive login or verification flows.
 Z.AI browser OAuth uses the registered `zcode://zai-auth/callback` redirect on
 every supported platform. macOS captures that callback automatically; Linux and
 Windows start a localhost listener plus a paste fallback so login can finish
-without the ZCode desktop app. API-key and custom-provider access also work on
+without the ZCode desktop app. After a Desktop login, Import or the next
+`zcode -p` can also map existing `~/.zcode/v2/credentials.json` tokens onto
+`provider.zai.options.apiKey`. API-key and custom-provider access also work on
 every supported platform.
 
 Set `ZCODE_NODE=/absolute/path/to/node` when the desired Node.js executable is
@@ -407,7 +411,8 @@ ZCode reads configuration from `~/.zcode/cli/config.json` (or
 overrides from `zcode.json` or `.zcode/config.json` in the working directory.
 Existing files are never replaced.
 
-Three model-access paths are supported: Z.AI OAuth, Z.AI/BigModel
+Three model-access paths are supported: Z.AI OAuth (CLI callback on every
+platform, plus Desktop-token mapping after a Desktop login), Z.AI/BigModel
 Coding Plan API key, or a direct API key with a custom provider. For detailed
 setup steps, retries/timeouts, theme, and turn-completion notifications, see
 [Configuration](./docs/CONFIGURATION.md).

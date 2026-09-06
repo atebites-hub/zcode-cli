@@ -1,7 +1,8 @@
 import { copyFile, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, join, posix, win32 } from "node:path";
+import { basename, posix, win32 } from "node:path";
 
+import { tryDecryptDesktopCredential } from "./desktop-credentials.ts";
 import { updateUserConfig, userConfigPath, type UserConfigRecord } from "./model-access.ts";
 
 const desktopConfigDirectory = "v2";
@@ -69,6 +70,7 @@ export interface DesktopFamilyMigration {
   family: DesktopFamily;
   providerName: string;
   baseURL?: string;
+  apiKey?: string;
   models: DesktopModelMigration[];
 }
 
@@ -130,9 +132,26 @@ function baseURLFromOptions(options: unknown): string | undefined {
   return typeof baseURL === "string" && baseURL.trim().length > 0 ? baseURL.trim() : undefined;
 }
 
+function usableDesktopApiKey(
+  raw: unknown,
+  env: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform,
+  home: string,
+  username?: string
+): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const value = raw.trim();
+  if (!value) return undefined;
+  return tryDecryptDesktopCredential(value, { env, home, platform, username });
+}
+
 function buildMigrationPlan(
   desktopConfig: DesktopUserConfig,
-  setting: Record<string, unknown> | undefined
+  setting: Record<string, unknown> | undefined,
+  env: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform,
+  home: string,
+  username?: string
 ): DesktopMigrationPlan {
   const providers = desktopConfig.provider ?? {};
   const families = new Map<DesktopFamily, { score: number; plan: DesktopFamilyMigration }>();
@@ -162,7 +181,14 @@ function buildMigrationPlan(
         family: bestFamily,
         providerName: name,
         models,
-        baseURL: baseURLFromOptions(provider.options)
+        baseURL: baseURLFromOptions(provider.options),
+        apiKey: usableDesktopApiKey(
+          isRecord(provider.options) ? provider.options.apiKey : undefined,
+          env,
+          platform,
+          home,
+          username
+        )
       }
     });
   }
@@ -178,9 +204,11 @@ function buildMigrationPlan(
 export async function detectDesktopInstallation(
   env: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform,
-  fallbackHome: string = homedir()
+  fallbackHome: string = homedir(),
+  username?: string
 ): Promise<DesktopInstallation | null> {
   const configPath = desktopConfigPath(env, platform, fallbackHome);
+  const home = desktopHome(env, platform, fallbackHome);
   if (!await fileExists(configPath)) return null;
   let desktopConfig: DesktopUserConfig;
   let setting: Record<string, unknown> | undefined;
@@ -197,7 +225,7 @@ export async function detectDesktopInstallation(
       setting = undefined;
     }
   }
-  const plan = buildMigrationPlan(desktopConfig, setting);
+  const plan = buildMigrationPlan(desktopConfig, setting, env, platform, home, username);
   if (plan.families.length === 0) return null;
   return { configPath, plan };
 }
@@ -306,8 +334,10 @@ export async function applyDesktopMigration(
       : {} as Record<string, unknown>;
     const currentOptions = isRecord(current.options) ? current.options : {};
     const currentApiKey = typeof currentOptions.apiKey === "string" && currentOptions.apiKey.trim()
-      ? currentOptions.apiKey
+      && !currentOptions.apiKey.trim().startsWith("enc:v1:")
+      ? currentOptions.apiKey.trim()
       : undefined;
+    const importedApiKey = familyPlanEntry.apiKey?.trim();
 
     providers[family] = {
       ...current,
@@ -317,7 +347,7 @@ export async function applyDesktopMigration(
         ...currentOptions,
         apiKeyRequired: true,
         ...(familyPlanEntry.baseURL ? { baseURL: familyPlanEntry.baseURL } : {}),
-        ...(currentApiKey ? { apiKey: currentApiKey } : {})
+        ...(currentApiKey ? { apiKey: currentApiKey } : importedApiKey ? { apiKey: importedApiKey } : {})
       },
       models: mergeModels(
         isRecord(current.models) ? current.models : undefined,

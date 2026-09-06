@@ -3,7 +3,8 @@ import { appendFileSync } from "node:fs";
 import { constants as osConstants } from "node:os";
 import { basename } from "node:path";
 
-import { missingCodingPlanKey } from "../../../src/prompt-preflight.ts";
+import { cliAuthUnlockLabel, syncCliAuthFromDesktop } from "../../../src/cli-auth-sync.ts";
+import { ensureCodingPlanAccess } from "../../../src/prompt-preflight.ts";
 import { preflightSubmission } from "./prompt-preflight.ts";
 import {
   clearSetupPending,
@@ -853,11 +854,14 @@ class ZCodeTui {
       if (!this.loginRequired) void this.refreshGoal();
       if (!this.loginRequired) void this.refreshSessionUsage();
       if (await readSetupPending().catch(() => false)) {
+        await syncCliAuthFromDesktop().catch(() => undefined);
         if (await readConfiguredModelAccess().catch(() => null)) {
           // The user already configured model access outside the wizard (for
-          // example via `zcode login` or a hand-edited config.json); honor that
-          // as completed setup instead of showing the wizard again.
+          // example via `zcode login`, desktop OAuth tokens, or a hand-edited
+          // config.json); honor that as completed setup instead of showing the
+          // wizard again.
           await clearSetupPending().catch(() => {});
+          this.setLoginRequired(false);
         } else {
           void this.runFirstRunSetup();
         }
@@ -1526,7 +1530,7 @@ class ZCodeTui {
     const submission = queuedSubmission ?? protectSubmission(input);
     if (!input.startsWith("/") && !this.primaryTurnActive) {
       const allowed = await preflightSubmission({
-        validate: () => missingCodingPlanKey({
+        validate: () => ensureCodingPlanAccess({
           model: this.model,
           workingDirectory: this.options.workspaceDirectory
         }),
@@ -4092,7 +4096,7 @@ class ZCodeTui {
         items.push({
           value: "import-desktop",
           label: "Import settings from ZCode desktop",
-          description: `Copy desktop ${families} providers and model choices${desktop.plan.defaultFamily ? ` (selected: ${desktop.plan.defaultFamily})` : ""} · credentials are not copied`
+          description: `Copy desktop ${families} providers and model choices${desktop.plan.defaultFamily ? ` (selected: ${desktop.plan.defaultFamily})` : ""} · maps desktop OAuth tokens onto the CLI apiKey`
         });
       }
       items.push(
@@ -4144,7 +4148,10 @@ class ZCodeTui {
         if (!imported) continue; // Esc or deferred — back to method selection
       }
 
-      if (selected.value === "sign-in" || selected.value === "import-desktop") {
+      const importedAccess = selected.value === "import-desktop"
+        ? await readConfiguredModelAccess().catch(() => null)
+        : null;
+      if (selected.value === "sign-in" || (selected.value === "import-desktop" && !importedAccess)) {
         await this.submit("/login");
       }
 
@@ -4182,7 +4189,7 @@ class ZCodeTui {
         + "into your CLI config? A backup of the current config is saved first.",
       help: "Enter import · Esc cancel",
       items: [
-        { value: "import", label: `Import ${family} settings`, description: "Provider, baseURL and model list · no credentials" },
+        { value: "import", label: `Import ${family} settings`, description: "Provider, baseURL, model list, and usable desktop/OAuth credentials" },
         { value: "cancel", label: "Cancel", description: "Keep the current CLI configuration" }
       ]
     });
@@ -4199,10 +4206,16 @@ class ZCodeTui {
       return false;
     }
 
+    const synced = await syncCliAuthFromDesktop().catch(() => undefined);
+    if (await readConfiguredModelAccess().catch(() => null)) {
+      this.addNotice(`CLI auth unlocked from ${cliAuthUnlockLabel(synced?.status)}.`, "muted");
+      return true;
+    }
+
     const signIn = await this.showChoice({
       title: "Sign in to finish",
       prompt:
-        `Desktop credentials cannot be copied. Sign in with the ${family} Coding Plan now to complete setup?`,
+        `No usable desktop credentials mapped into the CLI. Sign in with the ${family} Coding Plan now to complete setup?`,
       help: "Enter select · Esc decide later",
       items: [
         { value: "now", label: "Sign in now (recommended)", description: "Opens the Coding Plan login picker" },

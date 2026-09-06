@@ -1,6 +1,7 @@
 import { access, readFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 
+import { syncCliAuthFromDesktop, type SyncCliAuthOptions } from "./cli-auth-sync.ts";
 import { userConfigPath } from "./model-access.ts";
 
 function record(value: unknown): Record<string, unknown> | undefined {
@@ -66,4 +67,41 @@ export async function missingCodingPlanKey(options: {
     || Object.keys(record(provider.headers) ?? {}).length > 0) return undefined;
   return `Model access is not configured for ${providerId}. Run /login or /setup in zcode, `
     + "or configure its API key before sending a prompt. No model request was sent.";
+}
+
+export async function ensureCodingPlanAccess(options: {
+  env?: NodeJS.ProcessEnv;
+  fallbackHome?: string;
+  model?: string;
+  platform?: NodeJS.Platform;
+  resolveApiKey?: SyncCliAuthOptions["resolveApiKey"];
+  username?: string;
+  workingDirectory?: string;
+} = {}): Promise<string | undefined> {
+  const sync = await syncCliAuthFromDesktop({
+    env: options.env,
+    fallbackHome: options.fallbackHome,
+    platform: options.platform,
+    resolveApiKey: options.resolveApiKey,
+    username: options.username
+  });
+  if (sync.status === "unavailable") {
+    switch (sync.reason) {
+      case "resolve-failed":
+        return "Desktop OAuth tokens were found but a Coding Plan API key could not be resolved. "
+          + `${sync.message ?? "Key resolution failed."} Run /login or configure its API key `
+          + "before sending a prompt. No model request was sent.";
+      case "decrypt-failed":
+        return "Desktop OAuth credentials could not be decrypted for this user or HOME. "
+          + "Run /login or configure its API key before sending a prompt. No model request was sent.";
+      case "no-config":
+      case "no-tokens":
+        break;
+      default: {
+        const _exhaustive: never = sync.reason;
+        return _exhaustive;
+      }
+    }
+  }
+  return missingCodingPlanKey(options);
 }
