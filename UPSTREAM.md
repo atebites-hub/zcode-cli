@@ -31,7 +31,7 @@ Do not `git push` to `upstream`.
 
 - **Upstream:** https://github.com/kingsword09/zcode-cli
 - **Parent:** [kingsword09/zcode-cli](https://github.com/kingsword09/zcode-cli)
-- **Last synced upstream tip:** <!-- upstream-tip-begin -->`83c924d25e0d450d1ad49d2a8cfc594c65f7dc4b` (`3.11.2-20`, `docs(config): drop redundant capability fields from multimodal guide (#128)`)<!-- upstream-tip-end -->
+- **Last synced upstream tip:** <!-- upstream-tip-begin -->`376a641139697fdc0a0afe6db2400314375b7c8f` (`3.11.2-22`, `chore(release): prepare zcode-app-cli 3.11.2-22 (#134)`)<!-- upstream-tip-end -->
 - **Legacy last shared ancestor:** `7f3d73b5c3daa1b5c2b8585e4a6b5899014ac6d7` (`3.10.2-18`). Factory patches were retargeted on that tree, then replayed onto `2c9f458` and merged forward through this tip (upstream `5b6a6fd`–`83c924d`).
 
 The weekday sync workflow rewrites only the `upstream-tip-begin/end` span when it opens a clean sync PR.
@@ -61,6 +61,12 @@ These are atebites-only. Do not drop them in an upstream merge without recording
 Required factory patch ids in `runtimePatchPlan`: `usage-footer`, `route-selection`, `runtime-attestation`, `strict-advisor-hooks`. Optional: `context-cache-from-parts`.
 
 On the 3.11.2 tip, `route-selection` restore-policy input and `strict-advisor-hooks` foreground empty-output anchors were retargeted (minified locals + extra restore-call args + hook `{output,diagnostics}` unwrap). `context-cache-from-parts` still skips as expected.
+
+The 3.11.2-22 sync retains both upstream's required `model-catalog-reload`
+patch and Factory's required `usage-footer`; neither replaces the other.
+The TUI retains Factory's desktop-auth/preflight path alongside upstream's
+`ModelCatalogRefresh`. The default-plan regression requires both patches
+and rejects duplicate patch IDs.
 
 ## Deferred (intentionally not in this fork yet)
 

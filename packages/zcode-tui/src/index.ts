@@ -6,6 +6,7 @@ import { basename } from "node:path";
 import { cliAuthUnlockLabel, syncCliAuthFromDesktop } from "../../../src/cli-auth-sync.ts";
 import { planFirstRunTuiStart } from "../../../src/first-run-setup.ts";
 import { ensureCodingPlanAccess } from "../../../src/prompt-preflight.ts";
+import { ModelCatalogRefresh } from "../../../src/model-catalog-refresh.ts";
 import { preflightSubmission } from "./prompt-preflight.ts";
 import {
   clearSetupPending,
@@ -700,6 +701,7 @@ class ZCodeTui {
   private backgroundDrainScheduled = false;
   private backgroundHandoffInterruptInFlight = false;
   private updateCheckAbortController?: AbortController;
+  private modelCatalogRefresh?: ModelCatalogRefresh;
   private loginRequired: boolean;
   private setupLoginInteraction?: SetupLoginInteraction;
   private firstRunSetupArmed = false;
@@ -865,6 +867,13 @@ class ZCodeTui {
       this.updateTurnStatus();
       this.ui.requestRender(true);
       this.startUpdateRefresh(updateCheck);
+      if (this.options.reloadModelOptions) {
+        this.modelCatalogRefresh = new ModelCatalogRefresh({
+          baseUrl: process.env.ZCODE_BASE_URL?.trim() || "https://zcode.z.ai",
+          currentVersion: this.distributionVersion || this.options.version || "0.0.0"
+        });
+        this.modelCatalogRefresh.start();
+      }
       if (!this.loginRequired) void this.refreshGoal();
       if (!this.loginRequired) void this.refreshSessionUsage();
       if (this.firstRunSetupArmed) {
@@ -1744,6 +1753,7 @@ class ZCodeTui {
     const explicitModel = explicitModelRequest(input);
     if (explicitModel) {
       this.addUserMessage(submission.displayInput);
+      await this.refreshModelOptions();
       await this.switchTransientModel(explicitModel);
       return;
     }
@@ -2248,7 +2258,7 @@ class ZCodeTui {
     this.debugEvent("session", value);
     if (turnEpoch !== undefined && turnEpoch !== this.activeTurnEpoch) return;
     const event = normalizeEvent(value);
-    if (!event) return;
+    if (!event || this.isForeignSessionEvent(event)) return;
     const taskScoped = this.backgroundTaskEvents.isTaskScoped(event);
     this.applyBackgroundTaskEvent(event);
     if (!taskScoped && event.kind && toolLifecycleEventKinds.has(event.kind)) this.turnHadWorkActivity = true;
@@ -2423,8 +2433,12 @@ class ZCodeTui {
   private onSessionEvent(value: unknown): void {
     this.debugEvent("session-subscription", value);
     const event = normalizeEvent(value);
-    if (!event) return;
+    if (!event || this.isForeignSessionEvent(event)) return;
     this.applyBackgroundTaskEvent(event);
+  }
+
+  private isForeignSessionEvent(event: StreamEvent): boolean {
+    return Boolean(this.sessionId && event.sessionId && event.sessionId !== this.sessionId);
   }
 
   private isBackgroundCoordinatorReasoning(event: StreamEvent): boolean {
@@ -3764,17 +3778,14 @@ class ZCodeTui {
     return true;
   }
 
-  /**
-   * Refresh modelOptions from the bridge. After a fresh login
-   * (loginRequired was true) the runtime skipped model loading, so the
-   * initial options list may be empty; all model-switch entry points share
-   * this refresh.
-   */
+  /** All model selectors re-read the catalog, including after first-run login. */
   private async refreshModelOptions(): Promise<void> {
-    if (this.modelOptions.length === 0 && this.options.listModelOptions) {
+    const load = this.options.reloadModelOptions ?? this.options.listModelOptions;
+    if (load) {
       try {
-        const refreshed = await this.options.listModelOptions();
-        if (Array.isArray(refreshed) && refreshed.length > 0) {
+        await this.modelCatalogRefresh?.apply([this.model]).catch(() => {});
+        const refreshed = await load();
+        if (Array.isArray(refreshed)) {
           this.modelOptions = [...refreshed];
         }
       } catch (error) {
@@ -5788,6 +5799,7 @@ class ZCodeTui {
     for (const controller of this.steerAbortControllers) controller.abort();
     this.steerAbortControllers.clear();
     this.updateCheckAbortController?.abort();
+    this.modelCatalogRefresh?.stop();
     if (this.turnTimer) clearInterval(this.turnTimer);
     if (this.rewindEscapeTimer) clearTimeout(this.rewindEscapeTimer);
     if (this.fullscreenWelcomeTransitionTimer) clearTimeout(this.fullscreenWelcomeTransitionTimer);
