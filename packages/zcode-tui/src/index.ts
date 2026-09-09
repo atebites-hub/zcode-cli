@@ -3,13 +3,9 @@ import { appendFileSync } from "node:fs";
 import { constants as osConstants } from "node:os";
 import { basename } from "node:path";
 
-<<<<<<< HEAD
 import { cliAuthUnlockLabel, syncCliAuthFromDesktop } from "../../../src/cli-auth-sync.ts";
 import { ensureCodingPlanAccess } from "../../../src/prompt-preflight.ts";
-=======
-import { missingCodingPlanKey } from "../../../src/prompt-preflight.ts";
 import { ModelCatalogRefresh } from "../../../src/model-catalog-refresh.ts";
->>>>>>> upstream/main
 import { preflightSubmission } from "./prompt-preflight.ts";
 import {
   clearSetupPending,

@@ -898,14 +898,17 @@ describe("runtime synchronization", () => {
     expect(parseRuntimePatchReports([{ ...result.reports[0], status: "unknown" }])).toBeUndefined();
   });
 
-  test("keeps atebites Advisor, attestation, and ODW patches in the default runtime plan", () => {
+  test("keeps upstream model reload and atebites Advisor, attestation, and ODW patches in the default runtime plan", () => {
     const ids = runtimePatchPlan.map((patch) => patch.id);
+    expect(new Set(ids).size).toBe(ids.length);
     expect(ids.indexOf("tui-bridge")).toBeLessThan(ids.indexOf("usage-footer"));
+    expect(ids.indexOf("tui-bridge")).toBeLessThan(ids.indexOf("model-catalog-reload"));
     expect(ids.indexOf("usage-footer")).toBeLessThan(ids.indexOf("runtime-attestation"));
     expect(ids.indexOf("login-model-defaults")).toBeLessThan(ids.indexOf("route-selection"));
     expect(runtimePatchPlan.find((patch) => patch.id === "context-cache-from-parts")?.requirement)
       .toBe("optional");
     for (const id of [
+      "model-catalog-reload",
       "usage-footer",
       "route-selection",
       "runtime-attestation",

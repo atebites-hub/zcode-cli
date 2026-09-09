@@ -876,7 +876,6 @@ export function patchRuntimeTuiBridge(runtime: string): string {
   return patched;
 }
 
-<<<<<<< HEAD
 /**
  * Inject a token-usage footer into the headless `runPrompt` exit path so ODW (and any
  * ZCODE_ODW_PROTOCOL=1 caller) can recover token telemetry from the otherwise-opaque
@@ -1039,7 +1038,8 @@ export function patchRuntimeUsageFooter(runtime: string): string {
     patched = patched.slice(0, edit.start) + edit.text + patched.slice(edit.end);
   }
   return patched;
-=======
+}
+
 export function patchRuntimeModelCatalogReload(runtime: string): string {
   if (/reloadModelOptions:[A-Za-z_$][\w$]*\.reloadModelOptions/u.test(runtime)
     && runtime.includes(".reloadModelOptions=async()=>")) return runtime;
@@ -1059,7 +1059,6 @@ export function patchRuntimeModelCatalogReload(runtime: string): string {
   const reload = `${bridge}.reloadModelOptions=async()=>{let $zApp=await ${getApp}(),$zConfig=${createConfig}({env:${host}.env??process.env,workingDirectory:(${host}.cwd??process.cwd)(),projectConfigPath:${host}.projectConfigPath,skipUserConfig:${host}.skipUserConfig,userConfigPath:${host}.userConfigPath}).config,$zModel=$zConfig.model;if($zModel&&$zApp.setModelCatalogOverlay)await $zApp.setModelCatalogOverlay({targets:[$zModel.main,...$zModel.lite?[$zModel.lite]:[],...$zModel.available??[]],catalogOverrides:$zConfig.modelCatalog.overrides});return $zApp.listModels?.()??[]}`;
   return runtime.replace(list[0], `${reload},${list[0]}`)
     .replace(option[0], `reloadModelOptions:${option[1]}.reloadModelOptions,${option[0]}`);
->>>>>>> upstream/main
 }
 
 export function patchRuntimeOAuthHttpErrors(runtime: string): string {
@@ -1522,18 +1521,17 @@ export const runtimePatchPlan: readonly RuntimePatchDefinition[] = [
       && runtime.includes(".loadSessionContextMessages=async()=>await(await")
   },
   {
-<<<<<<< HEAD
     id: "usage-footer",
     requirement: "required",
     apply: patchRuntimeUsageFooter,
     verify: (runtime) => runtime.includes("zcode_usage")
-=======
+  },
+  {
     id: "model-catalog-reload",
     requirement: "required",
     apply: patchRuntimeModelCatalogReload,
     verify: (runtime) => /reloadModelOptions:[A-Za-z_$][\w$]*\.reloadModelOptions/u.test(runtime)
       && runtime.includes(".reloadModelOptions=async()=>")
->>>>>>> upstream/main
   },
   {
     id: "goal-failure-pause",
