@@ -31,8 +31,8 @@ Do not `git push` to `upstream`.
 
 - **Upstream:** https://github.com/kingsword09/zcode-cli
 - **Parent:** [kingsword09/zcode-cli](https://github.com/kingsword09/zcode-cli)
-- **Last synced upstream tip:** <!-- upstream-tip-begin -->`376a641139697fdc0a0afe6db2400314375b7c8f` (`3.11.2-22`, `chore(release): prepare zcode-app-cli 3.11.2-22 (#134)`)<!-- upstream-tip-end -->
-- **Legacy last shared ancestor:** `7f3d73b5c3daa1b5c2b8585e4a6b5899014ac6d7` (`3.10.2-18`). Factory patches were retargeted on that tree, then replayed onto `2c9f458` and merged forward through this tip (upstream `5b6a6fd`–`83c924d`).
+- **Last synced upstream tip:** <!-- upstream-tip-begin -->`cdf58de3cc6c10393bc26bde40c81c4588c75526` (`cdf58de`, `fix(tui): smooth terminal title spinner animation (#138)`)<!-- upstream-tip-end -->
+- **Legacy last shared ancestor:** `7f3d73b5c3daa1b5c2b8585e4a6b5899014ac6d7` (`3.10.2-18`). Factory patches were retargeted on that tree, then replayed onto `2c9f458` and merged forward through `376a641` (upstream `5b6a6fd`–`83c924d`) and this TUI tip.
 
 The weekday sync workflow rewrites only the `upstream-tip-begin/end` span when it opens a clean sync PR.
 
@@ -67,6 +67,11 @@ patch and Factory's required `usage-footer`; neither replaces the other.
 The TUI retains Factory's desktop-auth/preflight path alongside upstream's
 `ModelCatalogRefresh`. The default-plan regression requires both patches
 and rejects duplicate patch IDs.
+
+The `cdf58de` sync is TUI-only: `#136` number-key shortcuts on permission
+prompts and `#138` animated session-title spinner. `packages/zcode-tui/src/index.ts`
+merged cleanly; factory first-run/desktop-auth and all listed runtime patches
+were unchanged. No factory divergence was dropped.
 
 ## Deferred (intentionally not in this fork yet)
 
