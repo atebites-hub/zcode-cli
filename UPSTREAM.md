@@ -31,7 +31,7 @@ Do not `git push` to `upstream`.
 
 - **Upstream:** https://github.com/kingsword09/zcode-cli
 - **Parent:** [kingsword09/zcode-cli](https://github.com/kingsword09/zcode-cli)
-- **Last synced upstream tip:** <!-- upstream-tip-begin -->`cdf58de3cc6c10393bc26bde40c81c4588c75526` (`cdf58de`, `fix(tui): smooth terminal title spinner animation (#138)`)<!-- upstream-tip-end -->
+- **Last synced upstream tip:** <!-- upstream-tip-begin -->`c691f6c4d8debaf07f6461c6873f7df25db33c95` (`c691f6c`, `chore(release): prepare zcode-app-cli 3.11.2-23 (#139)`)<!-- upstream-tip-end -->
 - **Legacy last shared ancestor:** `7f3d73b5c3daa1b5c2b8585e4a6b5899014ac6d7` (`3.10.2-18`). Factory patches were retargeted on that tree, then replayed onto `2c9f458` and merged forward through `376a641` (upstream `5b6a6fd`–`83c924d`) and this TUI tip.
 
 The weekday sync workflow rewrites only the `upstream-tip-begin/end` span when it opens a clean sync PR.
