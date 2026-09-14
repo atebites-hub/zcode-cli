@@ -1,0 +1,70 @@
+import type { TuiScenario } from "../scenarios/types.ts";
+import { ScenarioWorkspace } from "./scenario-workspace.ts";
+import { TerminalSession } from "./terminal-session.ts";
+
+export type ScenarioWorkspaceBackendName = "disk" | "mountx";
+
+export interface RunTuiScenarioOptions {
+  workspaceBackend?: ScenarioWorkspaceBackendName;
+}
+
+async function createScenarioWorkspace(
+  scenario: TuiScenario,
+  options: RunTuiScenarioOptions
+): Promise<ScenarioWorkspace> {
+  const backend = options.workspaceBackend === "mountx"
+    ? new (await import("./mountx-workspace-backend.ts")).MountxWorkspaceBackend()
+    : undefined;
+  return await ScenarioWorkspace.create({
+    backend,
+    files: scenario.files,
+    prefix: `zcode-${scenario.name}-`
+  });
+}
+
+export async function runAutomatedTuiScenario(
+  scenario: TuiScenario,
+  options: RunTuiScenarioOptions = {}
+): Promise<void> {
+  await using workspace = await createScenarioWorkspace(scenario, options);
+  await using session = TerminalSession.start({
+    command: [process.execPath, scenario.fixture],
+    workspace
+  });
+  try {
+    await scenario.run(session, workspace);
+    await session.exit();
+  } catch (error) {
+    const runtimeJournal = await workspace.readRuntimeJournal();
+    if (!runtimeJournal) throw error;
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`${message}\n\nRuntime journal:\n${runtimeJournal.trimEnd()}`, { cause: error });
+  }
+}
+
+export async function runManualTuiScenario(
+  scenario: TuiScenario,
+  options: RunTuiScenarioOptions = {}
+): Promise<number> {
+  await using workspace = await createScenarioWorkspace(scenario, options);
+  console.error(`Scenario: ${scenario.name}`);
+  console.error(`Workspace backend: ${workspace.backendName}`);
+  console.error(`Workspace: ${workspace.directory}`);
+  if (scenario.manualRun) return await scenario.manualRun(workspace);
+  console.error("Exit the TUI with /exit. The workspace will then be deleted.");
+  const child = Bun.spawn([process.execPath, scenario.fixture], {
+    cwd: workspace.directory,
+    env: {
+      ...process.env,
+      ...workspace.environment(),
+      CI: "0",
+      TERM: process.env.TERM ?? "xterm-256color",
+      ZCODE_DISABLE_UPDATE_CHECK: "1",
+      ZCODE_TUI_MODE: "regular"
+    },
+    stdin: "inherit",
+    stdout: "inherit",
+    stderr: "inherit"
+  });
+  return await child.exited;
+}

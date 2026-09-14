@@ -35,9 +35,22 @@ After a Desktop login, Import (or the next `zcode -p`) maps existing
 `provider.zai.options.apiKey` so the CLI can prompt without a separate key
 paste. Reopen setup anytime with `/setup`; press Esc to skip.
 
+## Host integration
+
+`zcode-app-cli` is designed to run as a normal child process of a terminal host
+or agent orchestrator. Hosts such as Herdr and Orca can launch the same
+published `zcode` command without depending on private runtime files. The
+launcher uses the host terminal without inserting a second PTY, forwards
+cancellation signals, preserves the runtime exit status, and exposes a small
+set of environment overrides.
+
+See [Host integration](./docs/HOST_INTEGRATION.md) for the versioned contract,
+Node.js example, terminal/PTY requirements, and compatibility rules.
+
 ## Table of contents
 
 - [Quick start](#quick-start)
+- [Host integration](#host-integration)
 - [Install and update](#install-and-update)
 - [Architecture](#architecture)
 - [Features](#features)

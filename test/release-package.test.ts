@@ -66,6 +66,14 @@ describe("release package", () => {
     expect(packageJson.scripts.build).toBe("tsdown");
     expect(packageJson.scripts["build:launcher"]).toContain("--filter launcher");
     expect(packageJson.scripts["build:tui"]).toContain("--filter tui");
+    expect(packageJson.scripts.test).toBe("bun run test:unit");
+    expect(packageJson.scripts["test:unit"]).toBe("bun test test/*.test.ts");
+    expect(packageJson.scripts["test:tui:component"]).toContain("scenario-runtime.test.ts");
+    expect(packageJson.scripts["test:tui:e2e"]).toContain("write-and-diff.test.ts");
+    expect(packageJson.scripts["test:tui:host"]).toBe("bun test test/tui/scenario-mountx.test.ts");
+    expect(packageJson.scripts["test:all"]).toContain("test:unit");
+    expect(packageJson.scripts["test:all"]).toContain("test:tui");
+    expect(packageJson.scripts["test:all"]).toContain("test:runtime");
     expect(packageJson.bin.zcode).toBe("bin/zcode.js");
     expect(packageJson.engines).toEqual({ node: ">=22.19.0" });
     expect(packageJson.dependencies.zigpty).toBeUndefined();
@@ -83,7 +91,7 @@ describe("release package", () => {
   test("syncs the runtime before running runtime-backed integration tests", async () => {
     const source = await Bun.file(new URL("../scripts/build-release.ts", import.meta.url)).text();
     const syncStep = source.indexOf('await run(["run", latest ? "sync" : "sync:locked"]);');
-    const testStep = source.indexOf('await run(["test"]);');
+    const testStep = source.indexOf('await run(["run", "test:all"]);');
 
     expect(syncStep).toBeGreaterThan(-1);
     expect(testStep).toBeGreaterThan(syncStep);
