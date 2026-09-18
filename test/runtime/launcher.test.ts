@@ -8,11 +8,11 @@ import { createInterface } from "node:readline";
 import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
-import { readRuntimeVersion } from "../src/launcher.ts";
+import { readRuntimeVersion } from "../../src/launcher.ts";
 
 let home = "";
 const node = Bun.which("node");
-const root = fileURLToPath(new URL("..", import.meta.url));
+const root = fileURLToPath(new URL("../..", import.meta.url));
 
 beforeAll(async () => {
   home = await mkdtemp(join(tmpdir(), "zcode-launcher-runtime-"));
@@ -602,7 +602,9 @@ describe("launcher/runtime integration", () => {
     };
     const result = await run(["app-server"], `${JSON.stringify(request)}\n`);
     expect(result.code).toBe(0);
-    expect(JSON.parse(result.stdout)).toMatchObject({
+    const response = result.stdout.trim().split("\n").map((line) => JSON.parse(line))
+      .find((message) => message.id === request.id);
+    expect(response).toMatchObject({
       id: 1,
       result: {
         plugins: expect.arrayContaining([

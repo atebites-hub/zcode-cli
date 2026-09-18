@@ -3,24 +3,23 @@ import { appendFileSync } from "node:fs";
 import { constants as osConstants } from "node:os";
 import { basename } from "node:path";
 
+<<<<<<< HEAD
 import { cliAuthUnlockLabel, syncCliAuthFromDesktop } from "../../../src/cli-auth-sync.ts";
 import { planFirstRunTuiStart } from "../../../src/first-run-setup.ts";
 import { ensureCodingPlanAccess } from "../../../src/prompt-preflight.ts";
 import { ModelCatalogRefresh } from "../../../src/model-catalog-refresh.ts";
+=======
+import { missingCodingPlanKey } from "../../../src/prompt-preflight.ts";
+>>>>>>> upstream/main
 import { preflightSubmission } from "./prompt-preflight.ts";
 import {
   clearSetupPending,
   readConfiguredModelAccess,
+  hasConfiguredProviderAccess,
   readSetupPending,
-  readUserConfig,
-  updateUserConfig,
-  userConfigPathHint
+  providerConfigPathHint
 } from "../../../src/model-access.ts";
-import {
-  applyDesktopMigration,
-  detectDesktopInstallation,
-  type DesktopInstallation
-} from "../../../src/desktop-migration.ts";
+
 import {
   availableUpdateVersion,
   readStartupUpdate,
@@ -30,7 +29,6 @@ import {
 
 import {
   Container,
-  Editor,
   isKeyRelease,
   isViewportTUI,
   Markdown,
@@ -79,6 +77,7 @@ import {
   type StreamEvent
 } from "./events.ts";
 import { buildExitSummary } from "./exit-summary.ts";
+import { PlanEditor } from "./plan-editor.ts";
 import { FooterBar } from "./footer-bar.ts";
 import {
   ContextDetailView,
@@ -117,6 +116,7 @@ import {
   type UserQuestion
 } from "./interactions.ts";
 import { PermissionPreview } from "./permission-view.ts";
+import { PermissionRequestQueue } from "./permission-request-queue.ts";
 import { createRuntimePluginReferenceLister } from "./plugin-references.ts";
 import {
   formatWorkflowPanel,
@@ -157,9 +157,8 @@ import {
   isModelPickerRequest,
   modePicker,
   modelPicker,
-  providerModelPicker,
-  type PickerSpec,
-  type ProviderModelGroup
+  sessionRenameRequest,
+  type PickerSpec
 } from "./selectors.ts";
 import { RichMarkdown } from "./rich-markdown.ts";
 import {
@@ -200,6 +199,7 @@ import {
 } from "./selection-command.ts";
 import {
   emitSessionTerminalTitle,
+  normalizeSessionTitle,
   SESSION_TITLE_SPINNER_FRAME_DURATION_MS,
   sessionTitleFromFirstMessage,
   sessionTitleSpinnerFrame
@@ -331,6 +331,24 @@ const questionDoneValue = "__done__";
 const backgroundTaskAttentionStatuses = new Set(["failed", "timed_out", "spawn_error", "lost"]);
 const defaultBackgroundResumeMessage =
   "Continue the assigned task from the last completed step. Re-check the current workspace state and finish the remaining work.";
+
+function isMouseMultiplexer(): boolean {
+  const term = process.env.TERM?.toLowerCase() ?? "";
+  return process.env.TMUX !== undefined
+    || process.env.ZELLIJ !== undefined
+    || process.env.STY !== undefined
+    || term.startsWith("tmux")
+    || term.startsWith("screen");
+}
+
+function scrollbarHoverProbe(data: string): string | undefined {
+  if (!isMouseMultiplexer()) return undefined;
+  const match = /^\x1b\[<(\d+);(\d+);(\d+)M$/u.exec(data);
+  if (!match) return undefined;
+  const button = Number(match[1]);
+  if ((button & 32) !== 0 || (button & 3) !== 0) return undefined;
+  return `\x1b[<35;${match[2]};${match[3]}M`;
+}
 
 function backgroundTaskKindLabel(job: RuntimeBackgroundJob): string {
   switch (job.taskKind) {
@@ -570,6 +588,11 @@ class NotifyingProcessTerminal extends ProcessTerminal {
     super.start((data) => {
       this.beforeInput(data);
       try {
+        // Multiplexers use button-motion tracking and do not report passive
+        // pointer movement. Probe hover immediately before a press so a
+        // hidden auto scrollbar can still claim a direct drag gesture.
+        const hoverProbe = scrollbarHoverProbe(data);
+        if (hoverProbe) onInput(hoverProbe);
         onInput(data);
       } finally {
         this.afterInput?.();
@@ -612,7 +635,7 @@ class ZCodeTui {
   private readonly turnStatus: FooterBar;
   private readonly queuedInputView: QueuedInputView;
   private readonly attachmentBar: AttachmentBar;
-  private editor: Editor;
+  private editor: PlanEditor;
   private readonly assistantStream: AssistantStream;
   private readonly notifications: TurnNotifier;
   private readonly skillCatalog: SkillCatalog;
@@ -650,7 +673,9 @@ class ZCodeTui {
   private currentToolGroupMessageId?: string;
   private pendingAttachments: PromptImageAttachment[] = [];
   private readonly editorHistory: string[] = [];
-  private mode: Mode;
+  private mode: string;
+  private planEnabled = false;
+  private executionStateRevision = 0;
   private model: string;
   private tuiMode: TuiMode;
   private copyOnSelect = true;
@@ -668,6 +693,7 @@ class ZCodeTui {
   private workflowPanel?: Record<string, unknown>;
   private workflowView?: Markdown;
   private workflowRefreshInFlight = false;
+  private readonly permissionRequests = new PermissionRequestQueue();
   private choiceDepth = 0;
   private settingSwitchInFlight = false;
   private fullscreenWelcomeVisible = true;
@@ -706,7 +732,6 @@ class ZCodeTui {
   private backgroundDrainScheduled = false;
   private backgroundHandoffInterruptInFlight = false;
   private updateCheckAbortController?: AbortController;
-  private modelCatalogRefresh?: ModelCatalogRefresh;
   private loginRequired: boolean;
   private setupLoginInteraction?: SetupLoginInteraction;
   private firstRunSetupArmed = false;
@@ -738,7 +763,8 @@ class ZCodeTui {
       (width) => this.fullscreenHeader.identity(width),
       { loginRequired: options.loginRequired === true, includeIdentity: true }
     );
-    this.mode = normalizedMode(options.initialMode);
+    this.mode = options.initialMode ?? "build";
+    this.planEnabled = options.initialPlanEnabled ?? false;
     this.model = modelLabel(options.initialModel);
     this.thoughtLevel = options.initialThoughtLevel;
     this.modelOptions = [...(options.modelOptions ?? [])];
@@ -860,6 +886,7 @@ class ZCodeTui {
         this.addNotice(`Unable to load notification settings: ${notificationConfigError}`, "warning");
       }
       await this.restoreInitialTranscript();
+      await this.refreshExecutionState();
       if (this.transcript.blockCount > 0) this.enterSessionRail(true);
       if (updateCheck?.availableVersion && this.distributionVersion) {
         this.addUpdateAvailable(this.distributionVersion, updateCheck.availableVersion);
@@ -872,18 +899,20 @@ class ZCodeTui {
       this.updateTurnStatus();
       this.ui.requestRender(true);
       this.startUpdateRefresh(updateCheck);
-      if (this.options.reloadModelOptions) {
-        this.modelCatalogRefresh = new ModelCatalogRefresh({
-          baseUrl: process.env.ZCODE_BASE_URL?.trim() || "https://zcode.z.ai",
-          currentVersion: this.distributionVersion || this.options.version || "0.0.0"
-        });
-        this.modelCatalogRefresh.start();
-      }
       if (!this.loginRequired) void this.refreshGoal();
       if (!this.loginRequired) void this.refreshSessionUsage();
+<<<<<<< HEAD
       if (this.firstRunSetupArmed) {
         if (this.firstRunSkipRequested) {
           await this.dismissFirstRunSetup();
+=======
+      if (await readSetupPending().catch(() => false)) {
+        if (await hasConfiguredProviderAccess().catch(() => false)) {
+          // The user already configured model access outside the wizard (for
+          // example via `zcode login` or a hand-edited provider_config.json); honor that
+          // as completed setup instead of showing the wizard again.
+          await clearSetupPending().catch(() => {});
+>>>>>>> upstream/main
         } else {
           const firstRun = await planFirstRunTuiStart().catch(() => ({ action: "idle" as const }));
           switch (firstRun.action) {
@@ -1162,7 +1191,8 @@ class ZCodeTui {
         // Keep the chrome quiet until the transcript actually overflows and
         // the user scrolls. This is the default behavior used by pi-agent.
         scrollbar: "auto",
-        scrollbarStyle: this.theme.scrollbarThumb
+        scrollbarTrackStyle: this.theme.scrollbarTrack,
+        scrollbarThumbStyle: this.theme.scrollbarThumb
       });
       this.fullscreenLayout ??= new VStack([
         { component: this.fullscreenHeader, basis: 1, shrink: 0, minSize: 1 },
@@ -1178,8 +1208,12 @@ class ZCodeTui {
     this.ui.addChild(this.composerHost);
   }
 
-  private createEditor(tui: TUI): Editor {
-    const editor = new Editor(tui, this.theme.editor, { paddingX: 1, autocompleteMaxVisible: 7 });
+  private createEditor(tui: TUI): PlanEditor {
+    const editor = new PlanEditor(tui, this.theme.editor, { paddingX: 1, autocompleteMaxVisible: 7 });
+    editor.planEnabled = this.planEnabled;
+    editor.planColor = this.theme.accent;
+    editor.hintColor = this.theme.muted;
+    if (this.options.locale?.startsWith("zh")) editor.planHint = "先调研与规划，再开始修改";
     for (const input of [...this.editorHistory].reverse()) editor.addToHistory(input);
     const commands = this.autocompleteCommands();
     const workspaceDirectory = this.options.workspaceDirectory ?? process.cwd();
@@ -1446,6 +1480,7 @@ class ZCodeTui {
       });
     }
     for (const command of [
+      { name: "plan", description: "Toggle planning independently of permissions", argumentHint: "[on|off]" },
       { name: "cls", description: "Clear the visible transcript (the runtime's /clear starts a new session)" },
       { name: "copy", description: "Copy the active fullscreen selection or latest assistant response" },
       { name: "paste-image", description: "Attach an image from the system clipboard" },
@@ -1459,6 +1494,7 @@ class ZCodeTui {
       { name: "diff", description: "Browse current and per-turn file changes" },
       { name: "context", description: "Inspect context usage and prompt composition" },
       { name: "status", description: "Inspect detailed runtime and session status" },
+      { name: "rename", description: "Rename the current session", argumentHint: "<title>" },
       { name: "config", description: "Configure ZCode TUI settings" },
       { name: "settings", description: "Configure ZCode TUI settings" },
       { name: "search", description: "Search the retained transcript", argumentHint: "<text>|next|prev|clear" },
@@ -1736,6 +1772,11 @@ class ZCodeTui {
       await this.showStatusDetails();
       return;
     }
+    const renameRequest = sessionRenameRequest(input);
+    if (renameRequest !== undefined) {
+      await this.handleSessionRename(renameRequest);
+      return;
+    }
     if (input === "/config" || input === "/settings") {
       await this.showConfiguration();
       return;
@@ -1753,8 +1794,26 @@ class ZCodeTui {
     if (isModePickerRequest(input) && await this.showModePicker()) {
       return;
     }
+    if (/^\/mode(?:\s|$)/iu.test(input)) {
+      const mode = input.slice(5).trim().toLowerCase();
+      if (!modes.includes(mode as Mode)) {
+        this.addNotice("Choose /mode build, edit or yolo. Use /plan on or /plan off for planning.", "warning");
+      } else {
+        await this.applyModeShortcut(mode as Mode, true);
+      }
+      return;
+    }
+    if (/^\/plan(?:\s|$)/iu.test(input)) {
+      const argument = input.slice(5).trim().toLowerCase();
+      if (argument && argument !== "on" && argument !== "off") {
+        this.addNotice("Use /plan to toggle, or /plan on and /plan off.", "warning");
+      } else {
+        await this.switchPlan(argument === "on" ? true : argument === "off" ? false : undefined);
+      }
+      return;
+    }
     // Explicit `/model <provider/model>` is also a session-only switch — the
-    // runtime's plain /model command would persist model.main.
+    // bridge persists the native session selection without changing the shared default.
     const explicitModel = explicitModelRequest(input);
     if (explicitModel) {
       this.addUserMessage(submission.displayInput);
@@ -2205,6 +2264,7 @@ class ZCodeTui {
   ): Promise<void> {
     if (!isRecord(result)) return;
     if (result.resetSessionProjection === true) {
+      this.executionStateRevision++;
       this.clearTranscriptProjection();
       this.workflowView = undefined;
       this.sessionId = undefined;
@@ -2214,6 +2274,7 @@ class ZCodeTui {
       this.emittedSessionTerminalTitle = "";
       emitSessionTerminalTitle(this.options.stdout ?? process.stdout, "");
       this.sessionMetrics = {};
+      await this.restoreCustomSessionTitle();
       this.restoreTranscript(restoredMessages(result.restoredMessages));
       if (this.transcript.blockCount > 0) this.enterSessionRail(true);
     }
@@ -2224,9 +2285,11 @@ class ZCodeTui {
       this.recordAssistantText(this.assistantStream.reconcile(response));
     }
     if (appliesToSetting(settingTarget, "mode") && typeof result.mode === "string") {
-      this.mode = normalizedMode(result.mode, this.mode);
+      this.mode = result.mode;
     }
-    if (appliesToSetting(settingTarget, "model") && result.model !== undefined) {
+    if (typeof result.planEnabled === "boolean") this.planEnabled = result.planEnabled;
+    if (appliesToSetting(settingTarget, "model")
+      && result.model !== undefined) {
       this.model = modelLabel(result.model);
     }
     if (typeof result.loginRequired === "boolean") {
@@ -2259,6 +2322,21 @@ class ZCodeTui {
 
     if (isRecord(result.workflowPanel)) await this.showWorkflowPanel(result.workflowPanel);
     if (isRecord(result.selection)) await this.showSelection(result.selection);
+    if (result.resetSessionProjection === true) {
+      await this.refreshExecutionState();
+      try {
+        const persistedModel = await this.options.readSessionModel?.();
+        if (isRecord(persistedModel) && typeof persistedModel.model === "string") {
+          this.model = persistedModel.model;
+          this.thoughtLevel = asString(persistedModel.thoughtLevel);
+          if (Array.isArray(persistedModel.effortOptions)) this.effortOptions = persistedModel.effortOptions;
+        }
+      } catch {
+        // Model metadata is supplementary; the resume response remains usable.
+      }
+      this.updateMetadata();
+      this.ui.requestRender();
+    }
   }
 
   private onEvent(value: unknown, turnEpoch?: number): void {
@@ -2442,6 +2520,7 @@ class ZCodeTui {
     const event = normalizeEvent(value);
     if (!event || this.isForeignSessionEvent(event)) return;
     this.applyBackgroundTaskEvent(event);
+    this.scheduleRuntimeRefresh();
   }
 
   private isForeignSessionEvent(event: StreamEvent): boolean {
@@ -3201,6 +3280,7 @@ class ZCodeTui {
 
   private restoreTranscript(messages: RestoredMessage[]): void {
     let firstUserMessageText: string | undefined;
+    let lastAssistantModel: string | undefined;
     for (const message of messages) {
       this.currentToolGroup = undefined;
       this.currentToolGroupBlockId = undefined;
@@ -3216,6 +3296,7 @@ class ZCodeTui {
         }
         continue;
       }
+      if (message.role === "assistant" && message.model) lastAssistantModel = message.model;
       const hiddenToolIds = message.role === "assistant"
         ? backgroundToolPartIds(message.parts)
         : new Set<string>();
@@ -3241,6 +3322,7 @@ class ZCodeTui {
     this.currentToolGroupBlockId = undefined;
     this.currentToolGroupMessageId = undefined;
     this.assistantStream.breakSegment();
+    if (lastAssistantModel) this.model = lastAssistantModel;
   }
 
   private restorePart(part: RestoredPart, role: "assistant" | "system", fallbackMessageId?: string): void {
@@ -3372,12 +3454,18 @@ class ZCodeTui {
     this.ui.requestRender();
   }
 
-  private async requestPermission(requestValue: unknown, context?: unknown): Promise<unknown> {
-    const request = isRecord(requestValue) ? requestValue : {};
+  private requestPermission(requestValue: unknown, context?: unknown): Promise<unknown> {
     const contextRecord = isRecord(context) ? context : undefined;
     const signal = contextRecord?.abortSignal instanceof AbortSignal
       ? contextRecord.abortSignal
       : this.turnAbortController?.signal;
+    return this.permissionRequests.run(
+      () => this.requestPermissionUnqueued(requestValue, signal)
+    );
+  }
+
+  private async requestPermissionUnqueued(requestValue: unknown, signal?: AbortSignal): Promise<unknown> {
+    const request = isRecord(requestValue) ? requestValue : {};
     const toolName = asString(request.toolName) ?? "tool";
     const asksUserQuestion = isAskUserQuestionTool(toolName);
     const toolCallId = asString(request.toolCallId) ?? asString(request.toolUseId) ?? asString(request.callId);
@@ -3677,7 +3765,7 @@ class ZCodeTui {
     if (loginPicker) {
       commands.push({
         command: customProviderHelpCommand,
-        description: "Configure any supported endpoint in config.json without signing in",
+        description: "Configure any supported endpoint in provider_config.json without signing in",
         label: "Custom provider"
       });
     }
@@ -3701,12 +3789,13 @@ class ZCodeTui {
         return;
       }
       if (command.command === customProviderHelpCommand) {
+<<<<<<< HEAD
         if (loginPicker) this.noteSetupLoginInteraction({ kind: "custom-help" });
         const configPath = userConfigPathHint();
+=======
+>>>>>>> upstream/main
         this.addNotice(
-          `Custom providers do not require login. Copy config.example.json to ${configPath}, `
-          + "set provider kind, baseURL, apiKey and model IDs, then run /new. "
-          + "See README: Custom provider without login.",
+          `Configure custom providers in ${providerConfigPathHint()} (or ZCODE_PERSONAL_PROVIDER_CONFIG_FILE), then choose a model with /model. See provider.example.json for the schema.`,
           "muted"
         );
         return;
@@ -3774,7 +3863,7 @@ class ZCodeTui {
     if (picker.items.length === 0) return false;
     const selected = await this.showChoice({
       title: "Select mode",
-      prompt: `Current mode: ${this.mode}. Controls tool permission behavior.`,
+      prompt: `Current mode: ${this.mode}. Plan ${this.planEnabled ? "on" : "off"} · toggle with /plan`,
       help: "Up/Down choose · Enter switch · Esc cancel",
       items: picker.items.map((item) => ({ ...item, payload: item.value })),
       selectedIndex: picker.selectedIndex
@@ -3788,10 +3877,9 @@ class ZCodeTui {
 
   /** All model selectors re-read the catalog, including after first-run login. */
   private async refreshModelOptions(): Promise<void> {
-    const load = this.options.reloadModelOptions ?? this.options.listModelOptions;
+    const load = this.options.reloadModelOptions;
     if (load) {
       try {
-        await this.modelCatalogRefresh?.apply([this.model]).catch(() => {});
         const refreshed = await load();
         if (Array.isArray(refreshed)) {
           this.modelOptions = [...refreshed];
@@ -3805,12 +3893,7 @@ class ZCodeTui {
     }
   }
 
-  /**
-   * Quick session-level model switch via the flat picker. Uses the
-   * setTransientModel bridge so the runtime keeps the switch in-memory —
-   * config.json's model.main stays untouched. For persistent main/lite
-   * configuration use /settings → Model providers.
-   */
+  /** Switch this session while preserving the shared default model. */
   private async showModelPicker(): Promise<boolean> {
     await this.refreshModelOptions();
     const picker = modelPicker(this.modelOptions, this.model);
@@ -3829,12 +3912,6 @@ class ZCodeTui {
     return true;
   }
 
-  /**
-   * Session-only model switch. Requires the setTransientModel bridge; without
-   * it (older runtime) the only available switch path persists to config.json,
-   * which contradicts this feature's contract — refuse instead of silently
-   * rewriting saved defaults.
-   */
   private async switchTransientModel(modelId: string): Promise<void> {
     if (!this.options.setTransientModel) {
       this.addNotice(
@@ -3848,7 +3925,7 @@ class ZCodeTui {
     try {
       const previousModel = this.model;
       const result = await this.options.setTransientModel(modelId);
-      await this.handleResult(result, false, "model");
+      await this.handleResult(result, false);
       const status = this.model === previousModel ? "already active" : "now";
       this.addNotice(
         `Session model ${status}: ${this.model} · saved defaults unchanged.`,
@@ -3864,124 +3941,30 @@ class ZCodeTui {
     }
   }
 
-  /**
-   * Three-level cascade (provider → main → lite) embedded in the /settings
-   * menu. Persists both selections to config.json and applies the main model
-   * to the current session. Esc at each sub-level returns to the previous
-   * level: lite → main → provider → settings menu.
-   *
-   * Defaults are based on the SAVED config (model.main), not the session
-   * model — a quick /model switch in the session must not silently change
-   * what this persistent-configurator preselects.
-   */
+  /** Save the registry default for new sessions and apply it to this session. */
   private async showModelProviderSettings(): Promise<void> {
     await this.refreshModelOptions();
-    // Read the saved model config directly — readConfiguredModelAccess() is
-    // gated on a configured API key, but this editor must show config.model
-    // even when credentials are missing or incomplete.
-    const savedModelConfig = await readUserConfig()
-      .then((config) => (isRecord(config.model) ? config.model as Record<string, unknown> : undefined))
-      .catch(() => undefined);
-    const savedModel = typeof savedModelConfig?.main === "string" && savedModelConfig.main.trim()
-      ? savedModelConfig.main
-      : undefined;
-    const savedLite = typeof savedModelConfig?.lite === "string" && savedModelConfig.lite.trim()
-      ? savedModelConfig.lite
-      : undefined;
-
-    const cascade = providerModelPicker(this.modelOptions, savedModel ?? this.model);
-    if (!cascade || cascade.providers.items.length === 0) {
-      this.addNotice("No model providers available to configure.", "muted");
-      return;
-    }
-
-    let providerIndex = cascade.providers.selectedIndex;
-    while (!this.stopped) {
-      // Level 1 — provider
-      const providerChoice = await this.showChoice({
-        title: "Model providers",
-        prompt: "Configure the main and lite models for each provider.",
-        help: "Up/Down choose · Enter select · Esc back to settings",
-        items: cascade.providers.items,
-        selectedIndex: providerIndex
-      });
-      if (!providerChoice) return; // Esc → back to settings menu
-      providerIndex = cascade.providers.items.findIndex((item) => item.value === providerChoice.value);
-
-      const group = cascade.groups.find((g) => g.providerId === providerChoice.value);
-      if (!group) continue;
-
-      // Levels 2+3 — main → lite, nested so Esc at lite returns to main
-      // (not to the provider picker).
-      let confirmed = false;
-      // Track the in-progress main selection so Esc at lite returns to the
-      // model the user just chose, not the saved default.
-      let mainIndex = group.models.items.findIndex((item) => item.value === savedModel);
-      if (mainIndex < 0) mainIndex = group.models.selectedIndex;
-      while (!this.stopped && !confirmed) {
-        // Level 2 — main model
-        const mainChoice = await this.showChoice({
-          title: `Select main model · ${group.label}`,
-          prompt: "The main model handles agent turns.",
-          help: "Up/Down choose · Enter confirm · Esc back to provider",
-          items: group.models.items,
-          selectedIndex: mainIndex
-        });
-        if (!mainChoice) break; // Esc → back to provider selection (outer while)
-        mainIndex = group.models.items.findIndex((item) => item.value === mainChoice.value);
-
-        // Level 3 — lite model. Preselect the saved lite when it is a
-        // distinct model in this provider; otherwise default to "Same as
-        // main" (last index).
-        const liteCandidates = group.models.items
-          .filter((item) => item.value !== mainChoice.value)
-          .map((item) => ({ ...item, description: undefined }));
-        const sameAsMainItem = {
-          value: mainChoice.value,
-          label: "Same as main",
-          description: `default · ${mainChoice.label}`
-        };
-        const liteItems = [...liteCandidates, sameAsMainItem];
-        const savedLiteIndex = liteItems.findIndex(
-          (item) => item.value === savedLite && item.value !== mainChoice.value
-        );
-        const liteChoice = await this.showChoice({
-          title: `Select lite model · ${group.label}`,
-          prompt: "The lite model handles quick tasks and tool summaries.",
-          help: "Up/Down choose · Enter confirm · Esc back to main",
-          items: liteItems,
-          selectedIndex: savedLiteIndex >= 0 ? savedLiteIndex : liteItems.length - 1
-        });
-        if (!liteChoice) continue; // Esc → back to main selection (this while)
-
-        // Persist to config.json. A write failure surfaces as a notice and
-        // skips the session switch — the user can retry.
-        try {
-          await updateUserConfig((config) => {
-            const model = isRecord(config.model) ? config.model : {};
-            model.main = mainChoice.value;
-            model.lite = liteChoice.value;
-            config.model = model;
-          });
-        } catch (error) {
-          this.addNotice(
-            `Could not save model config: ${error instanceof Error ? error.message : String(error)}`,
-            "error"
-          );
-          continue;
-        }
-        this.addNotice(
-          `Model config saved: main=${mainChoice.label}, lite=${liteChoice.label}.`,
-          "muted"
-        );
-
-        // Apply main model to the current session
-        await this.applySettingCommand(`/model ${mainChoice.value}`, "model");
-        confirmed = true;
+    try {
+      const saved = await this.options.readDefaultModel?.();
+      const picker = modelPicker(this.modelOptions, saved);
+      if (picker.items.length === 0) {
+        this.addNotice("No model providers available to configure.", "muted");
+        return;
       }
-      // Return to the settings menu after a successful cascade instead of
-      // looping back to the provider picker.
-      if (confirmed) return;
+      const choice = await this.showChoice({
+        title: "Default model",
+        prompt: "Select the model used for new sessions.",
+        help: "Up/Down choose · Enter save · Esc back to settings",
+        items: picker.items,
+        selectedIndex: picker.selectedIndex
+      });
+      if (!choice) return;
+      if (!this.options.setDefaultModel) throw new Error("Saving the default model is unavailable.");
+      const result = await this.options.setDefaultModel(choice.value);
+      await this.handleResult(result, false);
+      this.addNotice(`Default model saved: ${choice.value}.`, "muted");
+    } catch (error) {
+      this.addNotice(`Could not save model config: ${error instanceof Error ? error.message : String(error)}`, "error");
     }
   }
 
@@ -4015,12 +3998,7 @@ class ZCodeTui {
       const methodOverride = Boolean(process.env.ZCODE_TUI_NOTIFICATION_METHOD?.trim());
       const conditionOverride = Boolean(process.env.ZCODE_TUI_NOTIFICATION_CONDITION?.trim());
       const tuiModeOverride = process.env.ZCODE_TUI_MODE?.trim().toLowerCase();
-      const savedConfig = await readUserConfig()
-        .then((config) => (isRecord(config.model) ? config.model as Record<string, unknown> : undefined))
-        .catch(() => undefined);
-      const savedModelLabel = typeof savedConfig?.main === "string" && savedConfig.main.trim()
-        ? savedConfig.main
-        : undefined;
+      const savedModelLabel = await this.options.readDefaultModel?.().catch(() => undefined);
       const setting = await this.showChoice({
         title: "ZCode settings",
         prompt: feedback,
@@ -4029,9 +4007,9 @@ class ZCodeTui {
           {
             value: "model-providers",
             label: "Model providers",
-            description: this.model === savedModelLabel || !savedModelLabel
-              ? `Saved: ${savedModelLabel ?? this.model}`
-              : `Session: ${this.model} · Saved: ${savedModelLabel}`
+            description: savedModelLabel
+              ? this.model === savedModelLabel ? `Saved: ${savedModelLabel}` : `Session: ${this.model} · Saved: ${savedModelLabel}`
+              : `Session: ${this.model} · No saved default`
           },
           {
             value: "notification-method",
@@ -4206,6 +4184,7 @@ class ZCodeTui {
   }
 
   private async runFirstRunSetup(manual = false): Promise<void> {
+<<<<<<< HEAD
     if (!manual) {
       this.firstRunSetupArmed = true;
       this.firstRunAbort = new AbortController();
@@ -4216,6 +4195,12 @@ class ZCodeTui {
     } catch {
       desktop = null;
     }
+=======
+    const access = await readConfiguredModelAccess().catch(() => null);
+    const statusHint = access
+      ? `Model access is already configured (${access.model}).`
+      : "Model access is not configured yet.";
+>>>>>>> upstream/main
 
     while (!this.stopped) {
       const access = await readConfiguredModelAccess().catch(() => null);
@@ -4235,6 +4220,7 @@ class ZCodeTui {
         : "Model access is not configured yet.";
 
       const items: ChoiceItem[] = [];
+<<<<<<< HEAD
       if (desktop) {
         const families = desktop.plan.families.map((entry) => entry.family).join("/");
         items.push({
@@ -4243,6 +4229,8 @@ class ZCodeTui {
           description: `Copy desktop ${families} providers and model choices${desktop.plan.defaultFamily ? ` (selected: ${desktop.plan.defaultFamily})` : ""} · maps desktop OAuth tokens onto the CLI apiKey`
         });
       }
+=======
+>>>>>>> upstream/main
       items.push(
         {
           value: "sign-in",
@@ -4252,7 +4240,7 @@ class ZCodeTui {
         {
           value: customProviderHelpCommand,
           label: "Custom provider",
-          description: "Configure any supported endpoint in config.json without signing in"
+          description: "Configure any supported endpoint in provider_config.json without signing in"
         },
         {
           value: "skip",
@@ -4280,17 +4268,15 @@ class ZCodeTui {
       if (selected.value === customProviderHelpCommand) {
         this.finishFirstRunSetup();
         await clearSetupPending().catch(() => {});
-        const configPath = userConfigPathHint();
         this.addNotice(
-          `Custom providers do not require login. Copy config.example.json to ${configPath}, `
-          + "set provider kind, baseURL, apiKey and model IDs, then run /new. "
-          + "See README: Custom provider without login.",
+          `Configure custom providers in ${providerConfigPathHint()} (or ZCODE_PERSONAL_PROVIDER_CONFIG_FILE), then choose a model with /model. See provider.example.json for the schema.`,
           "muted"
         );
         this.restoreInteractiveTerminal();
         return;
       }
 
+<<<<<<< HEAD
       if (selected.value === "import-desktop" && desktop) {
         const imported = await this.importDesktopSettings(desktop);
         if (!imported) continue; // Esc or deferred — back to method selection
@@ -4386,6 +4372,24 @@ class ZCodeTui {
     }
     return true;
   }
+=======
+      if (selected.value === "sign-in") await this.submit("/login");
+
+      const finalAccess = await readConfiguredModelAccess().catch(() => null);
+      if (finalAccess) {
+        await clearSetupPending().catch(() => {});
+        this.setLoginRequired(false);
+        this.addNotice("Setup complete · model access is configured.", "muted");
+        return;
+      }
+      // Login was attempted but did not produce model access. Loop back to
+      // the method selection so the user can try a different approach instead
+      // of being dropped out of the wizard.
+      this.addNotice("Login did not produce model access · choose another method or skip.", "muted");
+    }
+  }
+
+>>>>>>> upstream/main
 
   private handleRewindEscape(): void {
     if (this.rewindEscapePending) {
@@ -4598,22 +4602,62 @@ class ZCodeTui {
     await this.applyModeShortcut(nextMode(this.mode));
   }
 
-  private async applyModeShortcut(requestedMode: Mode): Promise<void> {
+  private async applyModeShortcut(requestedMode: Mode, announce = false): Promise<void> {
     if (this.settingSwitchInFlight) return;
     if (!this.options.setMode) {
       this.addNotice("Mode switching is unavailable in this runtime.", "warning");
       return;
     }
     this.settingSwitchInFlight = true;
+    this.executionStateRevision++;
     try {
       const result = await this.options.setMode(requestedMode);
-      const returnedMode = isRecord(result) ? asString(result.mode) : asString(result);
-      this.mode = normalizedMode(returnedMode, requestedMode);
+      this.applyExecutionState(result);
       this.updateMetadata();
+      if (announce) this.addNotice(`Mode switched to ${this.mode}.`, "muted");
     } catch (error) {
       this.addNotice(error instanceof Error ? error.message : String(error), "error");
     } finally {
       this.settingSwitchInFlight = false;
+      this.executionStateRevision++;
+      this.scheduleRuntimeRefresh(0);
+    }
+  }
+
+  private applyExecutionState(value: unknown): void {
+    if (!isRecord(value)) return;
+    if (typeof value.mode === "string") this.mode = value.mode;
+    if (typeof value.planEnabled === "boolean") this.planEnabled = value.planEnabled;
+  }
+
+  private async refreshExecutionState(): Promise<void> {
+    if (this.loginRequired || !this.options.readExecutionState) return;
+    try {
+      this.applyExecutionState(await this.options.readExecutionState());
+    } catch (error) {
+      this.addNotice(`Could not read execution state: ${error instanceof Error ? error.message : String(error)}`, "warning");
+    }
+  }
+
+  private async switchPlan(enabled?: boolean): Promise<void> {
+    if (!this.shortcutAvailable()) return;
+    if (!this.options.setPlanEnabled) {
+      this.addNotice("Plan switching is unavailable in this runtime.", "warning");
+      return;
+    }
+    this.settingSwitchInFlight = true;
+    this.executionStateRevision++;
+    try {
+      if (this.options.readExecutionState) this.applyExecutionState(await this.options.readExecutionState());
+      this.applyExecutionState(await this.options.setPlanEnabled(enabled ?? !this.planEnabled));
+      this.updateMetadata();
+      this.addNotice(`Plan ${this.planEnabled ? "enabled" : "disabled"} · permission mode: ${this.mode}.`, "muted");
+    } catch (error) {
+      this.addNotice(error instanceof Error ? error.message : String(error), "error");
+    } finally {
+      this.settingSwitchInFlight = false;
+      this.executionStateRevision++;
+      this.scheduleRuntimeRefresh(0);
     }
   }
 
@@ -4910,6 +4954,7 @@ class ZCodeTui {
         version: this.options.version,
         model: this.model,
         mode: this.mode,
+        planEnabled: this.planEnabled,
         effort: this.thoughtLevel,
         workspace: this.options.workspaceDirectory ?? process.cwd(),
         branch: this.options.workspaceGitBranch,
@@ -4923,6 +4968,40 @@ class ZCodeTui {
       }),
       items: [{ value: "close", label: "Close" }]
     });
+  }
+
+  /**
+   * `/rename <title>`: persists a user-owned session title through the
+   * runtime's setCustomSessionTitle capability, so the runtime's own title
+   * generator will not replace it later. Older runtimes without the bridge
+   * keep the previous title and say so.
+   */
+  private async handleSessionRename(title: string): Promise<void> {
+    if (!this.options.setCustomSessionTitle) {
+      this.addNotice("Session renaming is unavailable in this runtime.", "warning");
+      return;
+    }
+    if (!this.sessionId) {
+      this.addNotice("No active session to rename yet.", "warning");
+      return;
+    }
+    if (!title) {
+      this.addNotice("Usage: /rename <new title>", "muted");
+      return;
+    }
+    try {
+      await this.options.setCustomSessionTitle({ title });
+    } catch (error) {
+      this.addNotice(
+        `Rename failed: ${error instanceof Error ? error.message : String(error)}`,
+        "error"
+      );
+      return;
+    }
+    this.sessionTerminalTitle = title;
+    this.sessionTitleEmitted = true;
+    this.refreshSessionTerminalTitle();
+    this.addNotice(`Session renamed to: ${title}`, "muted");
   }
 
   private async readMcpSummary(): Promise<string | undefined> {
@@ -5296,7 +5375,7 @@ class ZCodeTui {
       return await choose(this.ui, this.choiceHost, this.theme, options);
     } finally {
       this.choiceDepth = Math.max(0, this.choiceDepth - 1);
-      this.focusEditor();
+      if (this.choiceDepth === 0) this.focusEditor();
       this.ui.requestRender();
     }
   }
@@ -5307,7 +5386,7 @@ class ZCodeTui {
       return await promptText(this.ui, this.choiceHost, this.theme, options);
     } finally {
       this.choiceDepth = Math.max(0, this.choiceDepth - 1);
-      this.focusEditor();
+      if (this.choiceDepth === 0) this.focusEditor();
       this.ui.requestRender();
     }
   }
@@ -5355,28 +5434,56 @@ class ZCodeTui {
     }
   }
 
-  private async restoreInitialTranscript(): Promise<void> {
-    if (!this.options.loadSessionTranscript) return;
+  private async restoreCustomSessionTitle(): Promise<void> {
     try {
-      this.restoreTranscript(restoredMessages(await this.options.loadSessionTranscript()));
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      this.addNotice(`Unable to restore session transcript: ${message}`, "warning");
+      const persistedTitle = await this.options.readCustomSessionTitle?.();
+      const title = typeof persistedTitle === "string" ? normalizeSessionTitle(persistedTitle) : "";
+      if (!title) return;
+      this.sessionTerminalTitle = title;
+      this.sessionTitleEmitted = true;
+      this.refreshSessionTerminalTitle();
+    } catch {
+      // Older runtimes and unavailable metadata fall back to the first message.
+    }
+  }
+
+  private async restoreInitialTranscript(): Promise<void> {
+    await this.restoreCustomSessionTitle();
+    if (this.options.loadSessionTranscript) {
+      try {
+        this.restoreTranscript(restoredMessages(await this.options.loadSessionTranscript()));
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.addNotice(`Unable to restore session transcript: ${message}`, "warning");
+      }
+    }
+    try {
+      const persistedModel = await this.options.readSessionModel?.();
+      if (isRecord(persistedModel) && typeof persistedModel.model === "string") {
+          this.model = persistedModel.model;
+          this.thoughtLevel = asString(persistedModel.thoughtLevel);
+          if (Array.isArray(persistedModel.effortOptions)) this.effortOptions = persistedModel.effortOptions;
+        }
+    } catch {
+      // Model metadata is supplementary; transcript restoration remains authoritative.
     }
   }
 
   private updateMetadata(): void {
+    this.editor.planEnabled = this.planEnabled;
     const fields: StatusLineField[] = [
       {
         text: this.theme.muted(`◈ ${this.model}`),
-        compactText: this.theme.muted(`◈ ${this.model}`),
+        compactText: this.theme.muted(`◈ ${this.model.slice(this.model.indexOf("/") + 1)}`),
         priority: 100,
-        required: true
+        required: true,
+        minWidth: 3
       },
       {
         text: this.theme.muted(`◉ ${this.mode}`),
         compactText: this.theme.muted(`◉ ${this.mode}`),
-        priority: 70
+        priority: 100,
+        required: true
       }
     ];
     if (this.thoughtLevel) {
@@ -5586,6 +5693,7 @@ class ZCodeTui {
   private applyRuntimeProjection(projection: RuntimeProjectionSnapshot | undefined): void {
     if (!projection) return;
     this.runtimeProjection = projection;
+    if (!this.settingSwitchInFlight) this.applyExecutionState(projection);
     this.noticeRestoredBackgroundTasks(projection);
     this.reconcileTurnTiming(projection);
     if (projection.sessionId) this.sessionId = projection.sessionId;
@@ -5655,6 +5763,7 @@ class ZCodeTui {
     try {
       do {
         this.runtimeRefreshPending = false;
+        const executionStateRevision = this.executionStateRevision;
         const [projectionResult, todosResult, contextMessagesResult] = await Promise.allSettled([
           this.options.readRuntimeProjection?.(),
           this.options.readTodos?.(),
@@ -5662,6 +5771,10 @@ class ZCodeTui {
             ? this.options.loadSessionContextMessages()
             : Promise.resolve(undefined)
         ]);
+        if (executionStateRevision !== this.executionStateRevision) {
+          this.runtimeRefreshPending = true;
+          continue;
+        }
         const next: RuntimePollState = {
           projection: this.runtimeProjection,
           todos: this.todos,
@@ -5840,7 +5953,6 @@ class ZCodeTui {
     for (const controller of this.steerAbortControllers) controller.abort();
     this.steerAbortControllers.clear();
     this.updateCheckAbortController?.abort();
-    this.modelCatalogRefresh?.stop();
     if (this.turnTimer) clearInterval(this.turnTimer);
     this.stopSessionTitleSpinner();
     if (this.rewindEscapeTimer) clearTimeout(this.rewindEscapeTimer);

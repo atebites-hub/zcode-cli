@@ -1,4 +1,5 @@
 {
+<<<<<<< HEAD:config.example.json
   "provider": {
     "zai": {
       "kind": "anthropic",
@@ -44,6 +45,8 @@
   "modelCatalog": {
     "overrides": {}
   },
+=======
+>>>>>>> upstream/main:setting.example.json
   "modelStream": {
     "idleTimeoutMs": 60000
   },
@@ -65,7 +68,6 @@
     "compact": true,
     "rewind": true,
     "subagent": true,
-    "memory": true,
     "skill": true,
     "mcp": true
   },
@@ -73,8 +75,6 @@
     "autoBackgroundMs": 1000
   },
   "memory": {
-    "use": true,
-    "write": true,
     "autoConsolidate": true,
     "summaryMaxBytes": 8192
   },
@@ -101,7 +101,6 @@
     "format": "text"
   },
   "ui": {
-    "locale": "auto",
     "theme": "auto",
     "tuiMode": "regular",
     "copyOnSelect": true,

@@ -120,6 +120,10 @@ if (patchRuntimeLoginModelDefaults(runtimeSource) !== runtimeSource
   || !runtimeSource.includes(".previewFileRewind=async e=>")
   || !runtimeSource.includes(".applyFileRewind=async e=>")
   || !runtimeSource.includes(".setMode=async")
+  || !runtimeSource.includes(".setPlanEnabled=async")
+  || !runtimeSource.includes(".readExecutionState=async")
+  || !runtimeSource.includes("...$zExecutionState")
+  || !runtimeSource.includes(".readSessionModel=async")
   || !runtimeSource.includes(".listSkills=async()=>await")
   || !runtimeSource.includes(".subscribeSessionEvents=")
   || !runtimeSource.includes(".sendBackgroundTaskMessage=async")
@@ -167,6 +171,7 @@ if (patchRuntimeLoginModelDefaults(runtimeSource) !== runtimeSource
   || !/listModelOptions:[A-Za-z_$][\w$]*\.listModelOptions/u.test(runtimeSource)
   || !/reloadModelOptions:[A-Za-z_$][\w$]*\.reloadModelOptions/u.test(runtimeSource)
   || !/setTransientModel:[A-Za-z_$][\w$]*\.setTransientModel/u.test(runtimeSource)
+  || !/readSessionModel:[A-Za-z_$][\w$]*\.readSessionModel/u.test(runtimeSource)
   || !/subscribeSessionEvents:[A-Za-z_$][\w$]*\.subscribeSessionEvents/u.test(runtimeSource)
   || !/sendBackgroundTaskMessage:[A-Za-z_$][\w$]*\.sendBackgroundTaskMessage/u.test(runtimeSource)) {
   throw new Error("The runtime compatibility patches are missing; run `bun run sync` again.");
@@ -208,11 +213,14 @@ if (version.code !== 0 || !/^\d+\.\d+\.\d+/.test(version.stdout.trim())) {
 const request = JSON.stringify({ id: 1, method: "session/list", params: {} });
 const protocol = await execute(node, [runtime, "app-server"], `${request}\n`);
 if (protocol.code !== 0) throw new Error(`app-server check failed: ${protocol.stderr}`);
-const response = JSON.parse(protocol.stdout.trim().split("\n")[0]) as {
+// New runtimes emit storage startup notifications before the RPC response.
+const response = protocol.stdout.trim().split("\n").map((line) => JSON.parse(line)).find(
+  (message) => message.id === 1
+) as {
   id?: number;
   result?: { sessions?: unknown[] };
 };
-if (response.id !== 1 || !Array.isArray(response.result?.sessions)) {
+if (!response || !Array.isArray(response.result?.sessions)) {
   throw new Error(`Unexpected app-server response: ${protocol.stdout}`);
 }
 

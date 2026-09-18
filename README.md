@@ -25,19 +25,39 @@ npm install -g zcode-app-cli@latest
 zcode
 ```
 
-On first launch, ZCode creates `~/.zcode/cli/config.json` (or
-`%USERPROFILE%\.zcode\cli\config.json` on Windows) with credential-free
+On first launch, ZCode creates `~/.zcode/cli/setting.json` (or
+`%USERPROFILE%\.zcode\cli\setting.json` on Windows) with credential-free
 defaults and opens a setup wizard in the TUI. It guides you through the three
+<<<<<<< HEAD
 model-access paths in [Configuration](./docs/CONFIGURATION.md), and when the
 ZCode desktop app is installed it can import the desktop provider settings.
 After a Desktop login, Import (or the next `zcode -p`) maps existing
 `~/.zcode/v2/credentials.json` OAuth tokens onto
 `provider.zai.options.apiKey` so the CLI can prompt without a separate key
 paste. Reopen setup anytime with `/setup`; press Esc to skip.
+=======
+model-access paths in [Configuration](./docs/CONFIGURATION.md). Provider settings
+and default model selection use the same native `~/.zcode/v2/provider_config.json`
+file as ZCode Desktop.
+Reopen it anytime with `/setup`; press Esc to skip.
+>>>>>>> upstream/main
+
+## Host integration
+
+`zcode-app-cli` is designed to run as a normal child process of a terminal host
+or agent orchestrator. Hosts such as Herdr and Orca can launch the same
+published `zcode` command without depending on private runtime files. The
+launcher uses the host terminal without inserting a second PTY, forwards
+cancellation signals, preserves the runtime exit status, and exposes a small
+set of environment overrides.
+
+See [Host integration](./docs/HOST_INTEGRATION.md) for the versioned contract,
+Node.js example, terminal/PTY requirements, and compatibility rules.
 
 ## Table of contents
 
 - [Quick start](#quick-start)
+- [Host integration](#host-integration)
 - [Install and update](#install-and-update)
 - [Architecture](#architecture)
 - [Features](#features)
@@ -108,7 +128,7 @@ multi-line editor; slash-command, unified `@` workspace/Plugin references and
 session events; `/mode`, `/model`, `/resume`, `/plugins` and other upstream
 slash commands; searchable model and reasoning-effort selectors, plus MCP and
 workflow panels; status-bar-only Shift+Tab mode cycling
-(`build` → `edit` → `yolo` → `plan`), Ctrl+N model and empty-prompt Tab effort
+(`build` → `edit` → `yolo`), independent `/plan` toggling with an input-border indicator, Ctrl+N model and empty-prompt Tab effort
 cycling; structured session-goal status in the right side of the turn footer;
 animated active-turn timer with a static `ZCODE_TUI_REDUCED_MOTION=1`
 fallback; responsive context-remaining and session-token metrics.
@@ -270,6 +290,7 @@ picker to return to input selection, then `Esc` again to close rewind.
 /diff                         browse current and per-turn file changes
 /context                      inspect context usage and source composition
 /status                       inspect detailed runtime and session status
+/rename <title>               rename the current session
 /activity                     inspect every active tool and open task
 /tasks                        inspect and manage background tasks
 /tasks message <id> <text>    send guidance to a running background agent
@@ -406,13 +427,30 @@ not available on `PATH`.
 
 ## Configuration
 
-ZCode reads configuration from `~/.zcode/cli/config.json` (or
-`%USERPROFILE%\.zcode\cli\config.json` on Windows), with project-level
+ZCode reads configuration from `~/.zcode/cli/setting.json` (or
+`%USERPROFILE%\.zcode\cli\setting.json` on Windows), with project-level
 overrides from `zcode.json` or `.zcode/config.json` in the working directory.
 Existing files are never replaced.
 
+<<<<<<< HEAD
 Three model-access paths are supported: Z.AI OAuth (CLI callback on every
 platform, plus Desktop-token mapping after a Desktop login), Z.AI/BigModel
+=======
+Provider settings and the default model are stored in
+`~/.zcode/v2/provider_config.json`, shared with ZCode Desktop by default.
+Use `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE` for an independent CLI provider file.
+`/settings` saves the default model; `/model` changes only the current session.
+See [`provider.example.json`](./provider.example.json) for complete field examples
+and the [provider configuration reference](./docs/PROVIDER_CONFIG.md) for multimodal
+capabilities, native search, token limits, reasoning maps and automatic upstream
+updates. The enabled example model inherits the catalog; disabled reference
+models demonstrate explicit overrides and manual configuration.
+中文文档：[配置说明](./docs/CONFIGURATION.zh-CN.md) ·
+[Provider 配置字段参考](./docs/PROVIDER_CONFIG.zh-CN.md)。
+The project follows the current upstream runtime and configuration schema.
+
+Three model-access paths are supported: Z.AI OAuth (macOS only), Z.AI/BigModel
+>>>>>>> upstream/main
 Coding Plan API key, or a direct API key with a custom provider. For detailed
 setup steps, retries/timeouts, theme, and turn-completion notifications, see
 [Configuration](./docs/CONFIGURATION.md).
