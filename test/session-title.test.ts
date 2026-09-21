@@ -78,6 +78,16 @@ describe("terminal title emission", () => {
     expect(stream.output).toBe("\x1b]0;\x07");
   });
 
+  test.each([
+    "safe\x07\x1b]0;INJECTED\x07",
+    "safe\u009c\u009d0;INJECTED\u009c",
+    "safe\x1b[2J"
+  ])("strips control sequences at the output boundary: %j", (title) => {
+    const stream = fakeStream(true);
+    emitSessionTerminalTitle(stream, title);
+    expect(stream.output).toBe(`\x1b]0;${SESSION_TITLE_PREFIX}safe\x07`);
+  });
+
   test("does not write to a non-TTY stream", () => {
     const stream = fakeStream(false);
     emitSessionTerminalTitle(stream, "fix the login bug");

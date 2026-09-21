@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 
-import { AppServerRequestError, requestAppServer } from "../src/app-server-client.ts";
+import {
+  AppServerProcessError,
+  AppServerRequestError,
+  requestAppServer
+} from "../src/app-server-client.ts";
 
 const node = Bun.which("node");
 
@@ -20,7 +24,8 @@ describe("app-server NDJSON client", () => {
       let input = "";
       process.stdin.setEncoding("utf8");
       process.stdin.on("data", chunk => input += chunk);
-      process.stdin.on("end", () => {
+      process.stdin.on("data", () => {
+        if (!input.includes("\\n")) return;
         const request = JSON.parse(input.trim());
         console.log(JSON.stringify({ id: request.id, result: { method: request.method, params: request.params } }));
       });
@@ -39,7 +44,7 @@ describe("app-server NDJSON client", () => {
   test("surfaces protocol errors with code and data", async () => {
     const script = `
       process.stdin.resume();
-      process.stdin.on("end", () => console.log(JSON.stringify({
+      process.stdin.once("data", () => console.log(JSON.stringify({
         id: 1,
         error: { code: -32602, message: "Invalid params", data: { field: "source" } }
       })));
@@ -55,11 +60,25 @@ describe("app-server NDJSON client", () => {
     }
   });
 
+  test("preserves app-server process exit codes", async () => {
+    try {
+      await requestAppServer({
+        method: "plugins/overview",
+        params: {},
+        transport: transport("process.stdin.resume(); process.stdin.once('data', () => process.exit(7));")
+      });
+      throw new Error("Expected request to fail.");
+    } catch (error) {
+      expect(error).toBeInstanceOf(AppServerProcessError);
+      expect(error).toMatchObject({ exitCode: 7 });
+    }
+  });
+
   test("rejects missing envelopes and honours cancellation", async () => {
     await expect(requestAppServer({
       method: "plugins/list",
       params: {},
-      transport: transport("process.stdin.resume(); process.stdin.on('end', () => console.log('not-json')); ")
+      transport: transport("process.stdin.resume(); process.stdin.once('data', () => {console.log('not-json');process.exit(0)}); ")
     })).rejects.toThrow(/did not return a response envelope/u);
 
     const controller = new AbortController();
@@ -70,6 +89,26 @@ describe("app-server NDJSON client", () => {
       signal: controller.signal,
       transport: transport("")
     })).rejects.toMatchObject({ name: "AbortError" });
+  });
+
+  test("keeps stdin open through unrelated messages and a chunked UTF-8 response", async () => {
+    expect(await requestAppServer({
+      method: "session/list", params: {}, transport: transport(`
+        let responded = false;
+        process.stdin.resume();
+        process.stdin.on("end", () => { if (!responded) process.exit(9); });
+        process.stdin.once("data", () => {
+          console.log(JSON.stringify({method:"startup/storageState",params:{phase:"ready"}}));
+          console.log(JSON.stringify({id:2,result:{ignored:true}}));
+          const response = Buffer.from(JSON.stringify({id:1,result:{sessions:[{title:"你好，世界"}]}}) + "\\n");
+          const split = response.indexOf(Buffer.from("界")) + 1;
+          setTimeout(() => {
+            process.stdout.write(response.subarray(0, split));
+            setTimeout(() => {responded=true;process.stdout.write(response.subarray(split));}, 30);
+          }, 150);
+        });
+      `)
+    })).toEqual({ sessions: [{ title: "你好，世界" }] });
   });
 
   test("finishes cancellation when the app-server ignores SIGTERM", async () => {
@@ -87,5 +126,23 @@ describe("app-server NDJSON client", () => {
     setTimeout(() => controller.abort(), 150);
 
     await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+  }, 3_000);
+
+  test("forwards SIGHUP and returns its conventional cancellation status", async () => {
+    if (process.platform === "win32") return;
+    const controller = new AbortController();
+    const pending = requestAppServer({
+      method: "plugins/list",
+      params: {},
+      signal: controller.signal,
+      transport: transport(`
+        process.on("SIGHUP", () => process.exit(0));
+        process.stdin.resume();
+        setInterval(() => {}, 1000);
+      `)
+    });
+    setTimeout(() => controller.abort("SIGHUP"), 150);
+
+    await expect(pending).rejects.toMatchObject({ name: "AbortError", exitCode: 129 });
   }, 3_000);
 });

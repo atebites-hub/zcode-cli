@@ -1,8 +1,9 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { describe, expect, test } from "bun:test";
+import { assertSessionModelReady } from "../src/session-model-recovery.ts";
 
 import {
   applyRuntimePatchPlan,
@@ -12,7 +13,9 @@ import {
   hasRuntimeCliHelpContract,
   hasRuntimeHttpNoContentGuard,
   hasRuntimeNetworkRetryGuard,
+  hasRuntimeSqliteBusyTimeout,
   hasRuntimeStreamEofFinishGuard,
+  installRuntimeProviderConfig,
   manifestUrl,
   parseArgs,
   parseRuntimePatchReports,
@@ -34,6 +37,9 @@ import {
   patchRuntimeTerminalToolProjection,
   patchRuntimeTuiBridge,
   patchRuntimeUsageFooter,
+  patchRuntimeSessionModelRecovery,
+  patchRuntimeSqliteBusyTimeout,
+  patchRuntimeTuiExecutionState,
   patchRuntimeZaiDesktopOAuth,
   resolveArtifactUrl,
   resolveLatestRuntimeLock,
@@ -41,6 +47,7 @@ import {
   selectRuntimeLock,
   serviceManifestUrl,
   serviceReleasePlatform,
+  sqliteBusyTimeoutMs,
   supportsMultiMessageFileRewind,
   writeRuntimeCompatibilityFailure
 } from "../scripts/sync-runtime.ts";
@@ -308,6 +315,107 @@ describe("runtime synchronization", () => {
     expect(() => patchRuntimeRouteSelection("incompatible runtime")).toThrow(/config keys anchor count 0/);
   });
 
+  test("adds session recovery at native restore and execution boundaries and can run twice", async () => {
+    const runtime = 'async function app(options){let read=()=>runtime,restore=label(async()=>{let ok=saved&&registry.validateSelection(saved);return read().setSessionModelSelection(ok?.ok?saved:void 0),saved},"restorePersistedModelSelection"),prepare=label(async args=>{await options.prepareUserExecutionBoundary(args)},"preparePromptBoundary");return{restore,prepare,getModelOption:label(model=>lookup(context.providerRegistry,model),"getModelOption")}}';
+    const patched = patchRuntimeSessionModelRecovery(runtime);
+    expect(patched).toContain('readSessionModelState:label(async()=>await');
+    expect(patched).toContain('read().$zRestoredSessionModel={selection:saved,registry:registry}');
+    expect(patched).toContain('assertSessionModelReady({registry:options.runtime.$zRestoredSessionModel?.registry');
+    expect(patchRuntimeSessionModelRecovery(patched)).toBe(patched);
+    expect(() => patchRuntimeSessionModelRecovery(runtime.replace('"restorePersistedModelSelection"', '"renamed"')))
+      .toThrow("restore/facade anchors missing");
+    const saved = { providerId: "old", modelId: "model" };
+    const registry = {
+      validateSelection: (selection: { providerId: string }) => selection.providerId === "valid" ? { ok: true } : { ok: false, code: "provider-not-found" },
+      getModel: () => undefined
+    };
+    let current: unknown;
+    const core = { getSessionModelSelection: () => current, setSessionModelSelection: (value: unknown) => { current = value; } };
+    const create = new Function("label", "registry", "saved", "runtime", "require", "__dirname", patched + ";return app;")(
+      (fn: unknown) => fn, registry, saved, core,
+      (id: string) => id === "node:path" ? { join } : { assertSessionModelReady }, "/fixture"
+    );
+    // The input facade does not receive providerRegistry; the restore closure owns it.
+    const facade = await create({ runtime: core, sessionId: "test", prepareUserExecutionBoundary: async () => { await facade.restore(); } });
+    await expect(facade.prepare({})).rejects.toThrow("the provider is unavailable");
+    await expect(facade.prepare({ intent: { modelSelection: { providerId: "valid", modelId: "model" } } })).resolves.toBeUndefined();
+  });
+
+  test("projects native planEnabled separately from permission mode", async () => {
+    const source = 'const a=fn=>fn;const modes=["plan","build","edit","yolo"];a(format,"formatAvailableCommandCenterModes");function format(){return modes.join(", ")}const planning=()=>e.runtime.getPlanEnabled();const app={getMode:a(()=>e.runtime.getMode(),"getMode"),setMode:a(async mode=>{let previous=e.runtime.getMode();await e.runtime.setExecutionState({mode:mode},e.traceContext);return{mode:e.runtime.getMode(),previousMode:previous,traceId:e.traceContext.traceId}},"setMode")};';
+    let mode = "edit", planEnabled = false;
+    const patched = patchRuntimeTuiExecutionState(source);
+    expect(new Function(`${patched};return format();`)()).toBe("build, edit, yolo");
+    const app = new Function("e", `${patched};return app;`)({ runtime: {
+      getMode: () => mode, getPlanEnabled: () => planEnabled,
+      setExecutionState: async (state: { mode?: string; planEnabled?: boolean }) => {
+        planEnabled = state.planEnabled ?? (state.mode ? false : planEnabled);
+        if (state.mode) mode = state.mode;
+      }
+    }, prepareResume: async () => {}, traceContext: { traceId: "fixture" } });
+    expect(await app.readExecutionState()).toEqual({ mode: "edit", planEnabled: false });
+    expect(await app.setPlanEnabled(true)).toEqual({ mode: "edit", planEnabled: true });
+    expect(app.getMode()).toBe("edit");
+    expect(await app.setMode("yolo")).toMatchObject({ mode: "yolo", previousMode: "edit", planEnabled: true });
+    expect(await app.setPlanEnabled(false)).toEqual({ mode: "yolo", planEnabled: false });
+    expect(patchRuntimeTuiExecutionState(patched)).toBe(patched);
+    expect(() => patchRuntimeTuiExecutionState("unknown runtime")).toThrow("execution state");
+  });
+
+  test("copies the registry catalog from Desktop resources and rejects missing assets", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "zcode-registry-sync-"));
+    const glm = join(directory, "resources", "glm"), vendor = join(directory, "vendor");
+    const config = join(directory, "resources", "config", "provider");
+    try {
+      await mkdir(vendor, { recursive: true });
+      await writeFile(join(vendor, "zcode.cjs"), 'label(resolveConfig,"resolveBundledZCodeBuiltinProviderConfig")');
+      await expect(installRuntimeProviderConfig(glm, vendor)).rejects.toThrow("missing config/provider");
+      await mkdir(config, { recursive: true });
+      await writeFile(join(config, "zcode-builtin.json"), '{"revision":28}');
+      await installRuntimeProviderConfig(glm, vendor);
+      expect(await readFile(join(vendor, "provider", "zcode-builtin.json"), "utf8")).toBe('{"revision":28}');
+      await writeFile(join(config, "zcode-builtin.json"), '{"revision":29}');
+      await installRuntimeProviderConfig(glm, vendor);
+      expect(await readFile(join(vendor, "provider", "zcode-builtin.json"), "utf8")).toBe('{"revision":29}');
+      await writeFile(join(vendor, "zcode.cjs"), "legacy runtime");
+      await rm(config, { recursive: true });
+      await expect(installRuntimeProviderConfig(glm, vendor)).rejects.toThrow("required provider registry");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps registry login defaults driven by the selected provider catalog", async () => {
+    const source = [
+      'const label=(fn)=>fn;let saved;const store={async saveConfiguredDefault(value){saved=value}};',
+      'function catalog(e){return e.providers.flatMap(([id,p])=>{let a=p.access,m=p.builtinModelIds?.find(x=>x.trim())?.trim();return a?.type==="zhipu-account"&&a.mode==="individual-coding-plan"&&a.accountType&&m?[{family:a.accountType,modelId:m,providerId:id}]:[]})}',
+      'async function resolveProvider(family,env){let p=catalog(env).filter(x=>x.family===family);if(p.length!==1)throw new Error("ambiguous provider");return p[0]}',
+      'async function persist(e){let p=await resolveProvider(e.providerId,e.env),id=p.providerId,model=p.modelId,unused;await store.saveConfiguredDefault({providerId:id,modelId:model});return saved}',
+      'function initial(e){return e.configuredDefault?.options?.reasoningLevel?e.configuredDefault:{providerId:"wrong",modelId:"fallback"}}',
+      'function complete(registry,selection){return {...selection,options:{reasoningLevel:"high"}}}',
+      'function switchModel(e,t){let selected=t;return e.runtime.setSessionModelSelection(selected),t?.transient||void 0,selected}',
+      'label(initial,"resolveInitialModelSelection");label(complete,"completeNewModelSelection");',
+      'label(catalog,"readStandaloneCodingPlanCatalog");label(resolveProvider,"resolveStandaloneCodingPlanProvider");label(persist,"persistStandaloneCodingPlanConnection");'
+    ].join("");
+    const patched = patchRuntimeLoginModelDefaults(source);
+    expect(patchRuntimeLoginModelDefaults(patched)).toBe(patched);
+    const { persist, initial, switchModel } = new Function(`${patched};return {persist,initial,switchModel};`)();
+    const provider = { access: { type: "zhipu-account", mode: "individual-coding-plan", accountType: "zai" }, builtinModelIds: ["GLM-5.3", "GLM-5.3-Flash"] };
+    const env = { providers: [["account:zai-individual-coding-plan", provider]] };
+    expect(await persist({ providerId: "zai", env })).toEqual({ providerId: "account:zai-individual-coding-plan", modelId: "GLM-5.3" });
+    provider.builtinModelIds.unshift("GLM-6");
+    expect(await persist({ providerId: "zai", env })).toMatchObject({ modelId: "GLM-6" });
+    expect(initial({ registry: {}, configuredDefault: { providerId: "custom", modelId: "chosen" } })).toEqual({
+      providerId: "custom", modelId: "chosen", options: { reasoningLevel: "high" }
+    });
+    expect(initial({ registry: {}, configuredDefault: { providerId: "custom", modelId: "chosen", options: { reasoningLevel: "low" } } })).toMatchObject({ options: { reasoningLevel: "low" } });
+    const context = { runtime: { setSessionModelSelection: () => {} }, providerRegistry: { getView: () => ({}) } };
+    expect(switchModel(context, { providerId: "custom", modelId: "chosen" })).toMatchObject({ options: { reasoningLevel: "high" } });
+    expect(switchModel(context, { providerId: "custom", modelId: "chosen", options: { reasoningLevel: "low" } })).toMatchObject({ options: { reasoningLevel: "low" } });
+    await expect(persist({ providerId: "bigmodel", env })).rejects.toThrow("ambiguous provider");
+    expect(() => patchRuntimeLoginModelDefaults(source.replace("modelId:model}", "modelId:hardcoded}"))).toThrow("anchors missing");
+  });
+
   test("pins the exact remote runtime used by release workflows", async () => {
     const packageJson = await Bun.file(new URL("../package.json", import.meta.url)).json();
     const lock = await Bun.file(new URL("../zcode-runtime.lock.json", import.meta.url)).json();
@@ -485,8 +593,68 @@ describe("runtime synchronization", () => {
     expect(hasRuntimeHttpNoContentGuard("runtime without the HTTP wrapper")).toBe(false);
   });
 
-  test("classifies wrapped transport failures without retrying in place after output", () => {
+  test("sets the SQLite write timeout after both migration paths without changing startup budgets", async () => {
     const runtime = [
+      'const deferred=Symbol();class Store{constructor(t={},n){this.dbPath=t.dbPath??"fixture.sqlite";let r=t.startupLockTimeoutMs??5e3;',
+      'this.db=new sqlite.DatabaseSync(this.dbPath,{timeout:r});',
+      'try{n!==deferred&&migrateSync(this.db,this.dbPath,r)}catch(e){this.db.close();throw e}}',
+      'static async openStartup(t={},n={}){let o=new Store(t,deferred);try{return await migrateAsync(o.db,o.dbPath,n),o}catch(e){try{o.close()}catch{}throw e}}',
+      'close(){this.db.close()}}'
+    ].join("");
+    const patched = patchRuntimeSqliteBusyTimeout(runtime);
+    expect(hasRuntimeSqliteBusyTimeout(runtime)).toBe(false);
+    expect(hasRuntimeSqliteBusyTimeout(patched)).toBe(true);
+    expect(hasRuntimeSqliteBusyTimeout(`unrelated "pragma busy_timeout = ${sqliteBusyTimeoutMs}"`)).toBe(false);
+    const opened: { options: unknown; path: string }[] = [];
+    const statements: string[] = [];
+    let migrationFailure = false;
+    type Database = { exec: (sql: string) => void; close: () => void };
+    const sqlite = {
+      DatabaseSync: function DatabaseSync(this: Database, path: string, options: unknown) {
+        opened.push({ options, path });
+        this.exec = (sql: string) => statements.push(sql);
+        this.close = () => { statements.push("close"); };
+      }
+    };
+    const Store = new Function("sqlite", "migrateSync", "migrateAsync", `${patched};return Store;`)(
+      sqlite,
+      (_db: Database, _path: string, timeout: number) => {
+        statements.push(`sync migration budget: ${timeout}`);
+        if (migrationFailure) throw new Error("migration failed");
+      },
+      async (db: Database) => {
+        db.exec("pragma busy_timeout = 25");
+        try { if (migrationFailure) throw new Error("migration failed"); }
+        finally { db.exec("pragma busy_timeout = 5000"); }
+      }
+    );
+    new Store({ startupLockTimeoutMs: 2500 });
+    expect(opened).toEqual([{ options: { timeout: 2500 }, path: "fixture.sqlite" }]);
+    expect(statements).toEqual(["sync migration budget: 2500", `pragma busy_timeout = ${sqliteBusyTimeoutMs}`]);
+    statements.length = 0;
+    await Store.openStartup();
+    expect(statements).toEqual(["pragma busy_timeout = 25", "pragma busy_timeout = 5000", `pragma busy_timeout = ${sqliteBusyTimeoutMs}`]);
+
+    // Failed migration paths must close the connection, not hand it to callers.
+    migrationFailure = true;
+    statements.length = 0;
+    await expect(Store.openStartup()).rejects.toThrow("migration failed");
+    expect(statements).toEqual(["pragma busy_timeout = 25", "pragma busy_timeout = 5000", "close"]);
+    statements.length = 0;
+    expect(() => new Store()).toThrow("migration failed");
+    expect(statements).toEqual(["sync migration budget: 5000", "close"]);
+    expect(patchRuntimeSqliteBusyTimeout(patched)).toBe(patched);
+    expect(() => patchRuntimeSqliteBusyTimeout("incompatible runtime")).toThrow(/migration anchors/);
+    expect(() => patchRuntimeSqliteBusyTimeout(runtime.replace("await migrateAsync", "await changed"))).not.toThrow();
+    expect(() => patchRuntimeSqliteBusyTimeout(runtime.replace("o.dbPath,n", "o.dbPath"))).toThrow(/migration anchors/);
+    expect(() => patchRuntimeSqliteBusyTimeout(runtime + runtime)).toThrow(/ambiguous/);
+    const partial = patched.replace(`,o.db.exec("pragma busy_timeout = ${sqliteBusyTimeoutMs}")`, "");
+    expect(hasRuntimeSqliteBusyTimeout(partial)).toBe(false);
+    expect(() => patchRuntimeSqliteBusyTimeout(partial)).toThrow(/migration anchors/);
+  });
+
+  test.each(["legacy", "budgeted"])("classifies transport failures without retrying after output (%s)", budget => {
+    let runtime = [
       "var yt2={ModelRequestFailed:'model_request_failed',ProviderNotConfigured:'provider_not_configured'},",
       "it2={Cancelled:'cancelled',NetworkError:'network_error',AuthFailed:'auth_failed',ServerError:'server_error',Unknown:'unknown'},",
       "nn2={NetworkError:'network_error',AuthRefresh:'auth_refresh',ServerError:'server_error'},",
@@ -519,12 +687,18 @@ describe("runtime synchronization", () => {
       "function* walk(e){let t=e,r=new WeakSet;for(let n=0;n<=6;n+=1){if(!t||typeof t!=='object'||r.has(t))return;r.add(t);yield t;t=t.cause}}",
       "function recoverable(e){for(let t of walk(e)){if(t.retryable===!0)return!0;let r=pP(t.context);if(r.retryable===!0)return!0}return!1}"
     ].join("");
+    if (budget === "budgeted") runtime = runtime.replace(
+      "function z9o(e){return e.emittedRetryBoundaryEvent||e.attempt>=e.maxAttempts",
+      'function budgetAllows(budget,attempt,max){return budget==="unbounded"||attempt<max}function inspectError(error){return {providerErrorCode:error.code}}function z9o(e){let code=inspectError(e.error).providerErrorCode;return e.emittedRetryBoundaryEvent||!budgetAllows(e.retryBudget,e.attempt,e.maxAttempts)'
+    );
     const patched = patchRuntimeNetworkRetryClassification(runtime);
 
     expect(hasRuntimeNetworkRetryGuard(runtime)).toBe(false);
     expect(hasRuntimeNetworkRetryGuard(patched)).toBe(true);
     expect(patched).toContain("function $zTransportChain(e,t){");
-    expect(patched).toContain("return e.emittedRetryBoundaryEvent||e.attempt>=e.maxAttempts");
+    expect(patched).toContain(budget === "legacy"
+      ? "return e.emittedRetryBoundaryEvent||e.attempt>=e.maxAttempts"
+      : "return e.emittedRetryBoundaryEvent||!budgetAllows(e.retryBudget,e.attempt,e.maxAttempts)");
     expect(patched).not.toContain("e.emittedRetryBoundaryEvent&&!$zTransportChain");
     expect(() => new Function(patched)).not.toThrow();
     expect(patchRuntimeNetworkRetryClassification(patched)).toBe(patched);
@@ -583,6 +757,10 @@ describe("runtime synchronization", () => {
     expect(gate(beforeOutput)).toBe(true);
     expect(gate({ ...beforeOutput, emittedRetryBoundaryEvent: true })).toBe(false);
     expect(gate({ ...beforeOutput, attempt: 6 })).toBe(false);
+    if (budget === "budgeted") {
+      expect(gate({ ...beforeOutput, attempt: 6, retryBudget: "unbounded" })).toBe(true);
+      expect(gate({ ...beforeOutput, attempt: 6, retryBudget: "unbounded", emittedRetryBoundaryEvent: true })).toBe(false);
+    }
     expect(gate({ ...beforeOutput, failure: { ...failure, reason: "cancelled" } })).toBe(false);
     expect(recoverable({ cause: wrapped, context: { retryable: failure.retryable } })).toBe(true);
 
@@ -596,7 +774,7 @@ describe("runtime synchronization", () => {
     expect(decide(cyclic)).toBe(false);
   });
 
-  test("adds a Desktop authorization-code completion path while retaining official persistence", () => {
+  test("adds Desktop OAuth with registry credential persistence", () => {
     const loginFunctions = [
       "async function sDo(e={}){",
       "let t=e.env??process.env,r=e.now??Date.now,o=e.sleep??fDo;",
@@ -605,8 +783,8 @@ describe("runtime synchronization", () => {
       "let c=await mDo({});",
       "try{await i.saveZaiLoginCredentials({accessToken:c.zai.access_token,jwtToken:c.token,user:c.user})}",
       "catch(f){throw new Ox(\"credential_write_failed\",\"Login succeeded but writing credentials failed.\",{cause:f})}",
-      "let d=await aGr({accessToken:c.zai.access_token,env:t,httpClient:e.httpClient,providerId:\"zai\",resolver:e.apiKeyResolver}),p;",
-      "try{p=await qz({apiKey:d,filePath:e.userConfigPath,providerId:\"zai\"})}",
+      `let d=await aGr({accessToken:c.zai.access_token,env:t,httpClient:e.httpClient,family:"zai",resolver:e.apiKeyResolver}),p;`,
+      `try{p=await qz({accountIdentity:c.user.user_id,apiKey:d,credentialStore:i,env:t,personalProviderConfigPath:e.personalProviderConfigPath,providerId:"zai"})}`,
       "catch(f){throw new Ox(\"config_update_failed\",\"Login succeeded but updating ZCode config failed.\",{cause:f})}",
       "return{configPath:p.path}}",
       "async function uDo(e={}){let t=e.env??process.env;F1(e.abortSignal);",
@@ -628,7 +806,7 @@ describe("runtime synchronization", () => {
     expect(patched).toContain('url:"https://zcode.z.ai/api/v1/oauth/token"');
     expect(patched).toContain("i.saveZaiLoginCredentials");
     expect(patched).toContain("aGr({accessToken:$zAccessToken");
-    expect(patched).toContain("qz({apiKey:$zApiKey");
+    expect(patched).toContain("qz({accountIdentity:$zUser.user_id,apiKey:$zApiKey");
     expect(() => new Function(patched)).not.toThrow();
     expect(patchRuntimeZaiDesktopOAuth(patched)).toBe(patched);
     expect(() => patchRuntimeZaiDesktopOAuth("incompatible runtime")).toThrow(/credential anchor/);
@@ -658,79 +836,15 @@ describe("runtime synchronization", () => {
         providerId: "zai"
       });
       expect(fixture.read()).toMatchObject({
-        resolved: { accessToken: "oauth-token", providerId: "zai" },
+        resolved: { accessToken: "oauth-token", family: "zai" },
         saved: { accessToken: "oauth-token", jwtToken: "jwt-token" },
         written: { apiKey: "coding-plan-key", providerId: "zai" }
       });
+      expect(fixture.read().written).toMatchObject({
+        accountIdentity: "user-1", credentialStore: { filePath: "/credentials.json" },
+        env: { ZCODE_CLI_OAUTH_CALLBACK_STDIN: "1" }
+      });
     });
-  });
-
-  test("updates the login model defaults to the current server catalog", () => {
-    const runtime = [
-      'function Cs(e){return typeof e==="object"&&e!==null&&!Array.isArray(e)}',
-      'function Pni(e,t,r){let o=ICt[t],n=Cs(e.provider)?e.provider:{},',
-      'i=Cs(n[t])?n[t]:{},a=Cs(i.options)?i.options:{},u=Cs(i.models)?i.models:{},',
-      'l=Cs(u[kCt])?u[kCt]:{},c=Cs(u[SCt])?u[SCt]:{},d=Cs(e.model)?e.model:{},',
-      'p=typeof d.lite=="string"?d.lite:o.liteModel,m={...a,apiKeyRequired:true,baseURL:o.baseURL};',
-      'return r.length>0&&(m.apiKey=r),{...e,provider:{...n,[t]:{...i,kind:xni,name:o.displayName,options:m,',
-      'models:{...u,[kCt]:{...l,name:"GLM-5.1"},[SCt]:{...c,name:"GLM-4.7"}}}},',
-      'model:{...d,main:o.mainModel,lite:p}}}',
-      'var fni="bigmodel",hni="zai",',
-      'gni="zai/glm-5.1",_ni="zai/glm-4.7",vni="bigmodel/glm-5.1",yni="bigmodel/glm-4.7",',
-      'kCt="glm-5.1",SCt="glm-4.7",xni="anthropic",',
-      'ICt={[fni]:{baseURL:"https://open.bigmodel.cn/api/anthropic",displayName:"BigModel Coding Plan",',
-      'liteModel:yni,mainModel:vni},[hni]:{baseURL:"https://api.z.ai/api/anthropic",',
-      'displayName:"Z.AI Coding Plan",liteModel:_ni,mainModel:gni}};'
-    ].join("");
-    const patched = patchRuntimeLoginModelDefaults(runtime);
-    const updateConfig = new Function(`${patched};return Pni;`)() as (
-      config: Record<string, unknown>,
-      providerId: string,
-      apiKey: string
-    ) => {
-      model: { lite: string; main: string };
-      provider: Record<string, { models: Record<string, unknown> }>;
-    };
-
-    expect(patched).toContain(
-      'gni="zai/glm-5.2",_ni="zai/glm-5-turbo",vni="bigmodel/glm-5.2",yni="bigmodel/glm-4.7"'
-    );
-    expect(patched).toContain('kCt="glm-5.2",SCt="glm-4.7"');
-    expect(patched).toContain('["glm-5-turbo"]:{...u["glm-5-turbo"],name:"GLM-5-Turbo"}');
-    expect(patched).not.toContain('gni="zai/glm-5.1"');
-    expect(patched).not.toContain('"GLM-5.1"');
-
-    const zai = updateConfig({}, "zai", "zai-key");
-    expect(zai.model).toEqual({ main: "zai/glm-5.2", lite: "zai/glm-5-turbo" });
-    expect(Object.keys(zai.provider.zai!.models).sort()).toEqual([
-      "glm-4.7",
-      "glm-5-turbo",
-      "glm-5.2"
-    ]);
-
-    const bigmodel = updateConfig({}, "bigmodel", "bigmodel-key");
-    expect(bigmodel.model).toEqual({ main: "bigmodel/glm-5.2", lite: "bigmodel/glm-4.7" });
-    expect(bigmodel.provider.bigmodel!.models["glm-4.7"]).toBeDefined();
-    expect(updateConfig(
-      { model: { lite: "zai/custom-lite" } },
-      "bigmodel",
-      "bigmodel-key"
-    ).model.lite).toBe("bigmodel/glm-4.7");
-    expect(updateConfig(
-      { model: { lite: "bigmodel/custom-lite" } },
-      "bigmodel",
-      "bigmodel-key"
-    ).model.lite).toBe("bigmodel/custom-lite");
-
-    const partiallyUpdated = runtime.replace(
-      'gni="zai/glm-5.1",_ni="zai/glm-4.7",vni="bigmodel/glm-5.1",yni="bigmodel/glm-4.7"',
-      'gni="zai/glm-5.2",_ni="zai/glm-5-turbo",vni="bigmodel/glm-5.2",yni="bigmodel/glm-4.7"'
-    );
-    expect(patchRuntimeLoginModelDefaults(partiallyUpdated)).toBe(patched);
-    expect(patchRuntimeLoginModelDefaults(patched)).toBe(patched);
-    expect(() => patchRuntimeLoginModelDefaults("incompatible runtime")).toThrow(
-      /login model defaults patch/
-    );
   });
 
   test("projects context cache usage from step-finish parts when message tokens are empty", () => {
@@ -1088,7 +1202,7 @@ describe("runtime synchronization", () => {
     expect(patched).toContain("E.listSkills=async()=>await H(e)");
     expect(patched).toContain("E.readGoal=async()=>await(await S()).readTarget?.()??null");
     expect(patched).toContain("E.readTodos=async()=>await(await S()).readTodos?.()??[]");
-    expect(patched).toContain("E.readRuntimeProjection=async()=>{let $zRuntimeProjectionBridge=await S();await E.$zRestorePersistedBackgroundTasks?.($zRuntimeProjectionBridge);let t=await $zRuntimeProjectionBridge.runtime?.getProjection?.();if(!t)return null;");
+    expect(patched).toContain("E.readRuntimeProjection=async()=>{let $zRuntimeProjectionBridge=await S();let $zExecutionState=await $zRuntimeProjectionBridge.readExecutionState();await E.$zRestorePersistedBackgroundTasks?.($zRuntimeProjectionBridge);let t=await $zRuntimeProjectionBridge.runtime?.getProjection?.();if(!t)return null;");
     expect(patched).toContain(".filter(o=>o.isBackgrounded===!0).map(o=>");
     expect(patched).toContain("backgroundTaskDetails:r");
     expect(patched).toContain("E.$zRestorePersistedBackgroundTasks=async $zApp=>");
@@ -1105,6 +1219,7 @@ describe("runtime synchronization", () => {
     expect(patched).toContain('$zSpawn.status!=="async_launched"&&$zSpawn.status!=="backgrounded"');
     expect(patched).toContain('status:$zStatus,taskType:"local_agent",type:"local_agent"');
     expect(patched).toContain('loadSessionContextMessages:a(async()=>await e.sessionStore.messages({sessionID:e.sessionId}),"loadSessionContextMessages")');
+    expect(patched).toContain('role:"agent",model:{providerId:r.info.providerID,modelId:r.info.modelID}');
     expect(patched).not.toContain("$zRuntimeProjectionBridge.loadSessionContextMessages?.()");
     expect(patched).not.toContain("e.loadSessionTranscript?.()");
     expect(patched).toContain("E.readSessionUsage=async()=>await(await S()).readSessionUsage?.()??null");
@@ -1116,7 +1231,7 @@ describe("runtime synchronization", () => {
     expect(patched).toContain("r.subagentPort.sendMessage({sessionId:o.parentSessionId??r.getSessionId?.()");
     expect(patched).toContain("E.previewFileRewind=async e=>{let t=await S();return await t.runtime?.previewWorkspaceFileRewind?.({targetMessageIds:e})??null}");
     expect(patched).toContain("E.applyFileRewind=async e=>{let t=await S();return await t.runtime?.applyWorkspaceFileRewind?.({targetMessageIds:e})??null}");
-    expect(patched).toContain("E.setMode=async e=>{let t=await S();if(t.setMode)return await t.setMode(e);t.runtime?.updateConfig?.({mode:e});return{mode:t.getMode?.()??e}}");
+    expect(patched).toContain("E.setMode=async e=>{return await(await S()).setMode(e)}");
     expect(patched).toContain("E.interruptTurn=async e=>");
     expect(patched).toContain("t.runtime?.stopActiveForegroundExecution?.({preserveQueueAutoDrainOnCancel:");
     expect(patched).toContain('e?.waitForIdle===!0&&t.runtime?.getActiveForegroundExecutionId');
@@ -1151,6 +1266,10 @@ describe("runtime synchronization", () => {
     expect(patched).toContain("promoteQueuedInput:g.promoteQueuedInput");
     expect(patched).toContain("listSkills:g.listSkills");
     expect(patched).toContain("setMode:g.setMode");
+    expect(patched).toContain("readSessionModel:g.readSessionModel");
+    expect(patched).toContain("await $zSessionModelApp.readSessionModelState()");
+    expect(patched).toContain('setModel(s.selection,{transient:!0})');
+    expect(patched).not.toContain('modelRef:String(e)');
     expect(patched).toContain("subscribeSessionEvents:g.subscribeSessionEvents");
     expect(patched).toContain("sendBackgroundTaskMessage:g.sendBackgroundTaskMessage");
     expect(patched).toContain("sessionStore.queryTaskUsage?.({sessionID:e.sessionId})");
@@ -1165,6 +1284,7 @@ describe("runtime synchronization", () => {
     )(
       bridge,
       async () => ({
+        readExecutionState: () => ({ mode: "edit", planEnabled: true }),
         runtime: {
           getProjection: () => ({
             activeToolCalls: [],
@@ -1190,6 +1310,7 @@ describe("runtime synchronization", () => {
     )(
       liveProjectionBridge,
       async () => ({
+        readExecutionState: () => ({ mode: "edit", planEnabled: true }),
         runtime: {
           getProjection: () => ({
             activeToolCalls: [],
@@ -1663,12 +1784,60 @@ describe("runtime synchronization", () => {
     expect(nativeSteerPatched).toContain('l1t(await(X.result??X.completion),Q,R5(t))');
     expect(nativeSteerPatched).not.toContain('l1t(X.result,Q,R5(t))');
     expect(patchRuntimeTuiBridge(nativeSteerPatched)).toBe(nativeSteerPatched);
+    const presentationSteerRuntime = nativeSteerRuntime.replace(
+      "input:A,inputId:$?.inputId",
+      'input:A,inputPresentation:$?.inputPresentation??($?.inputSource?void 0:"user_steer"),inputId:$?.inputId'
+    );
+    const presentationSteerPatched = patchRuntimeTuiBridge(presentationSteerRuntime);
+    expect(presentationSteerPatched).toContain('inputPresentation:$?.inputPresentation??($?.inputSource?void 0:"user_steer")');
+    expect(presentationSteerPatched).not.toContain('pendingInputId:$?.pendingInputId');
+    expect(patchRuntimeTuiBridge(presentationSteerPatched)).toBe(presentationSteerPatched);
     expect(() => patchRuntimeTuiBridge(
       nativeSteerRuntime.replace(
         "return t.runtime.admitPrompt(A,[],{...$,delivery:d,traceContext:$?.traceContext})",
         "return t.runtime.submitPrompt(A,$)"
       )
     )).toThrow(/active-turn steer delivery anchor missing/);
+  });
+
+  test("delegates session model persistence to the current runtime and refreshes reasoning options", async () => {
+    const runtime = [
+      "function R(e,t){return f(e,{rewindCreatedMessageId:t.revert?.createdMessageID,rewindKeptMessageIds:t.revert?.keptMessageIDs,rewindTargetMessageId:t.revert?.targetMessageID})}",
+      "async function L(e){if(!e.sessionStore)return[];let t=await e.sessionStore.messages({sessionID:e.sessionId});return p(t)}",
+      'function p(e){let t=[];for(let r of e){if(r.info.role==="user"){let l=r.text;t.push({content:l,role:"user"});continue}let n=[],s=[],u=r.text;t.push({content:u,...s.length>0?{parts:s}:{},role:"agent"})}return t}',
+      "function c(e,t){if(t.targetMessageId)return O(e,[t.targetMessageId]);let r=P(e,t.targetCheckpointId);return r?[r]:[]}",
+      "E.sendInput=async(A,$)=>{let c=t.runtime.getActiveTurnInfo();if(c)return t.runtime.steerTurn({commandKind:$?.commandKind,inputId:$?.inputId,queryId:$?.queryId,expectedTurnId:$?.expectedTurnId,input:A});return Kvt(await S(),D,O1(t))},",
+      'listSkills:k(()=>H(e),"listSkills"),',
+      "E.recallPreviousInput=async A=>await(await S()).recallPreviousInputHistory?.(A)??null,",
+      "CVr(E,S,r);",
+      "return c({recallPreviousInput:g.recallPreviousInput,sendInput:g.sendInput,submitPrompt:g})"
+    ].join("").replace(
+      "E.sendInput",
+      'loadSessionTranscript:a(async()=>await dUr({sessionId:e.sessionId,sessionStore:e.sessionStore}),"loadSessionTranscript"),readTodos:E.sendInput'
+    );
+    const patched = patchRuntimeTuiBridge(runtime);
+    const start = patched.indexOf("E.setTransientModel=async");
+    const end = patched.indexOf(",E.readSessionModel=", start);
+    const bridge: Record<string, unknown> = {};
+    const selections: string[] = [];
+    const setTransientModel = new Function(
+      "E",
+      "S",
+      `${patched.slice(start, end)};return E.setTransientModel;`
+    )(
+      bridge,
+      async () => ({
+        sessionId: "sess_model_switch",
+        setModel: async (model: string) => { selections.push(model); return { model }; },
+        getThoughtLevel: () => "high",
+        listThoughtLevels: () => ["disabled", "high"]
+      })
+    ) as (model: string) => Promise<unknown>;
+
+    expect(await setTransientModel("zai/glm-5.3-flash")).toMatchObject({
+      model: "zai/glm-5.3-flash", thoughtLevel: "high", effortOptions: ["disabled", "high"]
+    });
+    expect(selections).toEqual(["zai/glm-5.3-flash"]);
   });
 
   test("upgrades an already-patched runtime that lacks the transient model bridge", () => {
@@ -1694,7 +1863,7 @@ describe("runtime synchronization", () => {
     // injections to model an older patch generation.
     const fullyPatched = patchRuntimeTuiBridge(runtime);
     const stripped = fullyPatched
-      .replace(/[A-Za-z_$]+\.setTransientModel=async e=>await\(await [A-Za-z_$]+\(\)\)\.setModel\?\.\(e,\{transient:!0\}\),/u, "")
+      .replace(/[A-Za-z_$]+\.setTransientModel=async e=>\{.*?\},(?=[A-Za-z_$]+\.)/u, "")
       .replace(/setTransientModel:[A-Za-z_$][\w$]*\.setTransientModel,/u, "");
     expect(stripped).not.toMatch(/\.setTransientModel=async/u);
     expect(stripped).not.toMatch(/setTransientModel:[A-Za-z_$][\w$]*\.setTransientModel/u);
@@ -1722,7 +1891,7 @@ describe("runtime synchronization", () => {
     );
     const fullyPatched = patchRuntimeTuiBridge(runtime);
     const stripped = fullyPatched
-      .replace(/[A-Za-z_$]+\.setMode=async e=>\{let t=await [A-Za-z_$][\w$]*\(\);if\(t\.setMode\)return await t\.setMode\(e\);t\.runtime\?\.updateConfig\?\.\(\{mode:e\}\);return\{mode:t\.getMode\?\.\(\)\?\?e\}\},/u, "")
+      .replace(/[A-Za-z_$]+\.setMode=async e=>\{return await\(await [A-Za-z_$][\w$]*\(\)\)\.setMode\(e\)\},/u, "")
       .replace(/setMode:[A-Za-z_$][\w$]*\.setMode,/u, "");
     expect(stripped).not.toMatch(/\.setMode=async/u);
     expect(stripped).not.toMatch(/setMode:[A-Za-z_$][\w$]*\.setMode/u);
@@ -1731,6 +1900,91 @@ describe("runtime synchronization", () => {
     expect(patched).toMatch(/\.setMode=async/u);
     expect(patched).toMatch(/setMode:[A-Za-z_$][\w$]*\.setMode/u);
     expect(patchRuntimeTuiBridge(patched)).toBe(patched);
+  });
+
+  test("persists and reads custom session titles through runtime and legacy bridges", async () => {
+    const runtime = [
+      "function R(e,t){return f(e,{rewindCreatedMessageId:t.revert?.createdMessageID,rewindKeptMessageIds:t.revert?.keptMessageIDs,rewindTargetMessageId:t.revert?.targetMessageID})}",
+      "async function L(e){if(!e.sessionStore)return[];let t=await e.sessionStore.messages({sessionID:e.sessionId});return p(t)}",
+      'function p(e){let t=[];for(let r of e){if(r.info.role==="user"){let l=r.text;t.push({content:l,role:"user"});continue}let n=[],s=[],u=r.text;t.push({content:u,...s.length>0?{parts:s}:{},role:"agent"})}return t}',
+      "function c(e,t){if(t.targetMessageId)return O(e,[t.targetMessageId]);let r=P(e,t.targetCheckpointId);return r?[r]:[]}",
+      'loadSessionTranscript:a(async()=>await dUr({sessionId:e.sessionId,sessionStore:e.sessionStore}),"loadSessionTranscript"),readTodos:',
+      "E.sendInput=async(A,$)=>{let c=t.runtime.getActiveTurnInfo();if(c)return t.runtime.steerTurn({commandKind:$?.commandKind,inputId:$?.inputId,queryId:$?.queryId,expectedTurnId:$?.expectedTurnId,input:A});return Kvt(await S(),D,O1(t))},",
+      'listSkills:k(()=>H(e),"listSkills"),',
+      "E.recallPreviousInput=async A=>await(await S()).recallPreviousInputHistory?.(A)??null,",
+      "CVr(E,S,r);",
+      "return c({recallPreviousInput:g.recallPreviousInput,sendInput:g.sendInput,submitPrompt:g})"
+    ].join("");
+    const patched = patchRuntimeTuiBridge(runtime);
+    const setterStart = patched.indexOf("E.setCustomSessionTitle=async");
+    const readerStart = patched.indexOf("E.readCustomSessionTitle=async");
+    const end = patched.indexOf(",E.", readerStart);
+    expect(setterStart).toBeGreaterThan(-1);
+    expect(readerStart).toBeGreaterThan(setterStart);
+    expect(end).toBeGreaterThan(readerStart);
+
+    const sessions = new Map([
+      ["first", { title: "Original prompt", titleSource: "first_input" }],
+      ["second", { title: "Generated title", titleSource: "generated" }]
+    ]);
+    const store = { getSession: async (id: string) => sessions.get(id) };
+    const calls: unknown[] = [];
+    const core = {
+      sessionStore: store,
+      rootTraceContext: { traceId: "root" },
+      async setCustomSessionTitle(options: { title: string; traceContext?: unknown }) {
+        expect(this).toBe(core);
+        calls.push(options);
+        sessions.set(String(app.sessionId), { title: options.title, titleSource: "custom" });
+      }
+    };
+    let app: Record<string, unknown> = { sessionId: "first", runtime: core };
+    const bridge = new Function("S", `const E={};${patched.slice(setterStart, end)};return E;`)(
+      async () => app
+    ) as {
+      setCustomSessionTitle: (options: { title: string; traceContext?: unknown }) => Promise<unknown>;
+      readCustomSessionTitle: () => Promise<unknown>;
+    };
+    expect(await bridge.readCustomSessionTitle()).toBeUndefined();
+    await bridge.setCustomSessionTitle({ title: "Chosen title" });
+    expect(await bridge.readCustomSessionTitle()).toBe("Chosen title");
+    expect(calls).toEqual([{ title: "Chosen title", traceContext: core.rootTraceContext }]);
+
+    app.sessionId = "second";
+    expect(await bridge.readCustomSessionTitle()).toBeUndefined();
+    const explicitTrace = { traceId: "explicit" };
+    await bridge.setCustomSessionTitle({ title: "Second title", traceContext: explicitTrace });
+    expect(calls.at(-1)).toEqual({ title: "Second title", traceContext: explicitTrace });
+    expect(await bridge.readCustomSessionTitle()).toBe("Second title");
+    app.sessionId = "first";
+    expect(await bridge.readCustomSessionTitle()).toBe("Chosen title");
+
+    app = {
+      sessionId: "first",
+      sessionStore: store,
+      async setCustomSessionTitle(options: { title: string }) {
+        expect(this).toBe(app);
+        sessions.set(String(this.sessionId), { title: options.title, titleSource: "custom" });
+      }
+    };
+    await bridge.setCustomSessionTitle({ title: "Legacy alias" });
+    expect(await bridge.readCustomSessionTitle()).toBe("Legacy alias");
+    app = { sessionId: "missing" };
+    expect(await bridge.readCustomSessionTitle()).toBeUndefined();
+    await expect(bridge.setCustomSessionTitle({ title: "Unavailable" })).rejects.toThrow(/unavailable in this runtime/u);
+    app = { runtime: { setCustomSessionTitle: async () => { throw new Error("Store unavailable"); } } };
+    await expect(bridge.setCustomSessionTitle({ title: "Failed" })).rejects.toThrow("Store unavailable");
+
+    expect(patched).toContain("setCustomSessionTitle:g.setCustomSessionTitle");
+    expect(patched).toContain("readCustomSessionTitle:g.readCustomSessionTitle");
+    expect(patchRuntimeTuiBridge(patched)).toBe(patched);
+    const missingReader = patched
+      .replace(`${patched.slice(readerStart, end)},`, "")
+      .replace("readCustomSessionTitle:g.readCustomSessionTitle,", "");
+    const upgraded = patchRuntimeTuiBridge(missingReader);
+    expect(upgraded).toContain("readCustomSessionTitle:g.readCustomSessionTitle");
+    expect(upgraded.match(/\.readCustomSessionTitle=async/gu)).toHaveLength(1);
+    expect(patchRuntimeTuiBridge(upgraded)).toBe(upgraded);
   });
 
   test("auto-backgrounds long Agent calls while preserving explicit configuration", () => {
@@ -1963,7 +2217,7 @@ describe("runtime synchronization", () => {
     expect(patchRuntimeUsageFooter(patched)).toBe(patched);
   });
 
-  test("reclassifies a graceful mid-stream EOF without a finish reason as retryable", () => {
+  test.each(["legacy", "budgeted"])("reclassifies registry stream EOF as retryable (%s)", budget => {
     const runtime = [
       "function detectFallback(e){return}",
       "function findProviderError(e){return}",
@@ -1984,7 +2238,14 @@ describe("runtime synchronization", () => {
       "await Ac({...k,attempt:u,durationMs:de-c,requestHeaderCount:U,requestHeaders:F,responseHeaderCount:Object.keys(le).length,responseHeaders:le,providerRequestId:m2e(le),finishReason:x.finishReason,usage:x.usage,timeToFirstProviderEventMs:Z,timeToFirstContentMs:J,timeToFirstTextMs:Q,streamMaxIdleMs:X||void 0,streamStallCount:V,streamOutputCommitted:z,timestamp:new Date(de).toISOString(),type:\"model_request_completed\"},_A(e)),O=!0}",
       "r&&P&&await Yrt({modelIoFullRetentionEnabled:e.modelIoFullRetentionEnabled,attempt:u,debugDir:e.debugDir,isDev:n,normalizedToolCalls:S.snapshotNormalizedToolCalls(),options:P,recordModelIO:r,request:b,requestId:k.requestId,resolved:H,result:W,startedAt:c});return}"
     ].join("");
-    const source = `${runtime}${runner}`;
+    let source = `${runtime}${runner.replace(
+      'providerId:String(k.model.providerId),providerKind:k.providerKind,source:x.lastErrorChunk??x.lastFinishChunk})',
+      'providerId:String(k.providerId),providerKind:H.providerKind,source:x.lastErrorChunk??x.lastFinishChunk})??fallback({captcha:H.accountAccess?.mode==="start-plan",providerId:String(k.providerId),providerKind:H.providerKind})'
+    )}label(streamRunner,"runStreamText");`;
+    if (budget === "budgeted") source = source.replace(
+      "let retryState=createRetryState({maxAttempts:e.retry.maxAttempts});",
+      "let retryBudget=e.request.modelRetryBudget,retryState=createRetryState({maxAttempts:e.retry.maxAttempts});"
+    );
 
     expect(hasRuntimeStreamEofFinishGuard(source)).toBe(false);
     const patched = patchRuntimeStreamEofFinishGuard(source);
@@ -2003,6 +2264,7 @@ describe("runtime synchronization", () => {
     expect(() => patchRuntimeStreamEofFinishGuard("incompatible runtime")).toThrow(
       /stream EOF guard patch/
     );
+    expect(() => patchRuntimeStreamEofFinishGuard(source.replace('label(streamRunner,"runStreamText");', ""))).toThrow(/label missing/);
 
     // The guard must classify the SDK's synthetic "other" finish (null
     // finish_reason) and a missing reason as EOF, while trusting a provider

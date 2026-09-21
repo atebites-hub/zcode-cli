@@ -8,11 +8,13 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { formatVersionOutput, readDistributionVersion } from "../src/launcher.ts";
 import { capabilitiesFromExtractionMetadata } from "../src/runtime-capabilities.ts";
+import { requestAppServer } from "../src/app-server-client.ts";
 import {
   extractRuntimeCapabilities,
   hasRuntimeCliHelpContract,
   hasRuntimeHttpNoContentGuard,
   hasRuntimeNetworkRetryGuard,
+  hasRuntimeSqliteBusyTimeout,
   hasRuntimeStreamEofFinishGuard,
   patchRuntimeGoalFailurePause,
   patchRuntimeHttpNoContent,
@@ -23,6 +25,7 @@ import {
   patchRuntimeOfficialMcpAvailability,
   patchRuntimeRouteSelection,
   patchRuntimeStrictAdvisorHooks,
+  patchRuntimeSqliteBusyTimeout,
   patchRuntimeStreamEofFinishGuard,
   parseRuntimePatchReports,
   runtimePatchPlan,
@@ -98,6 +101,8 @@ if (patchRuntimeLoginModelDefaults(runtimeSource) !== runtimeSource
   || !hasRuntimeHttpNoContentGuard(runtimeSource)
   || patchRuntimeNetworkRetryClassification(runtimeSource) !== runtimeSource
   || !hasRuntimeNetworkRetryGuard(runtimeSource)
+  || patchRuntimeSqliteBusyTimeout(runtimeSource) !== runtimeSource
+  || !hasRuntimeSqliteBusyTimeout(runtimeSource)
   || patchRuntimeStreamEofFinishGuard(runtimeSource) !== runtimeSource
   || !hasRuntimeStreamEofFinishGuard(runtimeSource)
   || (patchEnabled("cli-help-contract") && !hasRuntimeCliHelpContract(runtimeSource))
@@ -120,6 +125,10 @@ if (patchRuntimeLoginModelDefaults(runtimeSource) !== runtimeSource
   || !runtimeSource.includes(".previewFileRewind=async e=>")
   || !runtimeSource.includes(".applyFileRewind=async e=>")
   || !runtimeSource.includes(".setMode=async")
+  || !runtimeSource.includes(".setPlanEnabled=async")
+  || !runtimeSource.includes(".readExecutionState=async")
+  || !runtimeSource.includes("...$zExecutionState")
+  || !runtimeSource.includes(".readSessionModel=async")
   || !runtimeSource.includes(".listSkills=async()=>await")
   || !runtimeSource.includes(".subscribeSessionEvents=")
   || !runtimeSource.includes(".sendBackgroundTaskMessage=async")
@@ -167,6 +176,7 @@ if (patchRuntimeLoginModelDefaults(runtimeSource) !== runtimeSource
   || !/listModelOptions:[A-Za-z_$][\w$]*\.listModelOptions/u.test(runtimeSource)
   || !/reloadModelOptions:[A-Za-z_$][\w$]*\.reloadModelOptions/u.test(runtimeSource)
   || !/setTransientModel:[A-Za-z_$][\w$]*\.setTransientModel/u.test(runtimeSource)
+  || !/readSessionModel:[A-Za-z_$][\w$]*\.readSessionModel/u.test(runtimeSource)
   || !/subscribeSessionEvents:[A-Za-z_$][\w$]*\.subscribeSessionEvents/u.test(runtimeSource)
   || !/sendBackgroundTaskMessage:[A-Za-z_$][\w$]*\.sendBackgroundTaskMessage/u.test(runtimeSource)) {
   throw new Error("The runtime compatibility patches are missing; run `bun run sync` again.");
@@ -205,15 +215,12 @@ if (version.code !== 0 || !/^\d+\.\d+\.\d+/.test(version.stdout.trim())) {
   throw new Error(`Version check failed: ${version.stderr || version.stdout}`);
 }
 
-const request = JSON.stringify({ id: 1, method: "session/list", params: {} });
-const protocol = await execute(node, [runtime, "app-server"], `${request}\n`);
-if (protocol.code !== 0) throw new Error(`app-server check failed: ${protocol.stderr}`);
-const response = JSON.parse(protocol.stdout.trim().split("\n")[0]) as {
-  id?: number;
-  result?: { sessions?: unknown[] };
-};
-if (response.id !== 1 || !Array.isArray(response.result?.sessions)) {
-  throw new Error(`Unexpected app-server response: ${protocol.stdout}`);
+const response = await requestAppServer({
+  method: "session/list", params: {},
+  transport: { command: node, args: [runtime, "app-server"], cwd: root, env: process.env }
+}) as { sessions?: unknown[] };
+if (!response || !Array.isArray(response.sessions)) {
+  throw new Error(`Unexpected app-server response: ${JSON.stringify(response)}`);
 }
 
 const tuiImport = await execute(node, [

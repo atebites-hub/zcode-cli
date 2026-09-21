@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { describe, expect, test } from "bun:test";
+import { parse } from "yaml";
 
 import { validatePackageTree } from "../scripts/check-package.ts";
 import { runtimePatchPlan } from "../scripts/sync-runtime.ts";
@@ -17,12 +18,19 @@ const requiredPaths = [
   "LICENSE",
   "README.md",
   "bin/zcode.js",
-  "config.example.json",
+  "setting.example.json",
+  "provider.example.json",
+  "docs/CONFIGURATION.md",
+  "docs/CONFIGURATION.zh-CN.md",
+  "docs/PROVIDER_CONFIG.md",
+  "docs/PROVIDER_CONFIG.zh-CN.md",
   "package.json",
   "vendor/extraction.json",
   "vendor/node_modules/@zcode/tui/dist/index.js",
   "vendor/node_modules/@zcode/tui/package.json",
   "vendor/zcode.cjs",
+  "vendor/cli-config.cjs",
+  "vendor/provider/zcode-builtin.json",
   "zcode-runtime.lock.json"
 ];
 
@@ -66,6 +74,16 @@ describe("release package", () => {
     expect(packageJson.scripts.build).toBe("tsdown");
     expect(packageJson.scripts["build:launcher"]).toContain("--filter launcher");
     expect(packageJson.scripts["build:tui"]).toContain("--filter tui");
+    expect(packageJson.scripts.test).toBe("bun run test:unit");
+    expect(packageJson.scripts["test:unit"]).toBe("bun test test/*.test.ts");
+    expect(packageJson.scripts["test:tui:component"]).toContain("scenario-runtime.test.ts");
+    expect(packageJson.scripts["test:tui:e2e"]).toContain("write-and-diff.test.ts");
+    expect(packageJson.scripts["test:tui:host"]).toBe("bun test test/tui/scenario-mountx.test.ts");
+    expect(packageJson.scripts["test:all"]).toContain("test:unit");
+    expect(packageJson.scripts["test:all"]).toContain("test:tui");
+    expect(packageJson.scripts["test:all"]).toContain("test:runtime");
+    expect(packageJson.scripts["test:all"]).toContain("test:node");
+    expect(packageJson.scripts["test:node"]).toBe("node --test test/node/*.test.cjs");
     expect(packageJson.bin.zcode).toBe("bin/zcode.js");
     expect(packageJson.engines).toEqual({ node: ">=22.19.0" });
     expect(packageJson.dependencies.zigpty).toBeUndefined();
@@ -80,10 +98,32 @@ describe("release package", () => {
     expect(packageJson.keywords).toEqual(expect.arrayContaining(["cli", "node", "terminal", "tui", "zcode"]));
   });
 
+  test("pins one Bun toolchain and tests the validated artifact with real Node versions", async () => {
+    const packageJson = await Bun.file(new URL("../package.json", import.meta.url)).json();
+    expect(packageJson.packageManager).toBe("bun@1.4.1");
+    expect(packageJson.devDependencies["bun-types"]).toBe("1.4.1");
+    for (const name of ["ci", "prepare-release", "publish"]) {
+      const workflow = parse(await Bun.file(new URL(`../.github/workflows/${name}.yml`, import.meta.url)).text());
+      for (const job of Object.values(workflow.jobs) as { steps?: { uses?: string; with?: Record<string, unknown> }[] }[]) {
+        for (const step of job.steps ?? []) {
+          if (step.uses?.startsWith("oven-sh/setup-bun@")) expect(step.with?.["bun-version"]).toBe("1.4.1");
+        }
+      }
+      if (name === "ci") {
+        const matrix = workflow.jobs["node-runtime"];
+        expect(matrix.needs).toBe("validate");
+        expect(matrix.strategy.matrix.node).toEqual(["22.19.0", "24", "26"]);
+        expect(matrix.strategy.matrix.include).toContainEqual({ os: "macos-latest", node: "24" });
+        expect(matrix.steps.some((step: { run?: string }) => step.run === "bun run test:node")).toBe(true);
+        expect(matrix.steps.some((step: { uses?: string }) => step.uses?.startsWith("actions/download-artifact@"))).toBe(true);
+      }
+    }
+  });
+
   test("syncs the runtime before running runtime-backed integration tests", async () => {
     const source = await Bun.file(new URL("../scripts/build-release.ts", import.meta.url)).text();
     const syncStep = source.indexOf('await run(["run", latest ? "sync" : "sync:locked"]);');
-    const testStep = source.indexOf('await run(["test"]);');
+    const testStep = source.indexOf('await run(["run", "test:all"]);');
 
     expect(syncStep).toBeGreaterThan(-1);
     expect(testStep).toBeGreaterThan(syncStep);
@@ -130,7 +170,7 @@ describe("release package", () => {
         url: "git+https://github.com/kingsword09/zcode-cli.git"
       },
       bin: { zcode: "bin/zcode.js" },
-      files: ["bin/zcode.js", "vendor", "config.example.json", "zcode-runtime.lock.json", "README.md", "LICENSE"],
+      files: ["bin/zcode.js", "vendor", "setting.example.json", "provider.example.json", "docs/CONFIGURATION.md", "docs/CONFIGURATION.zh-CN.md", "docs/PROVIDER_CONFIG.md", "docs/PROVIDER_CONFIG.zh-CN.md", "zcode-runtime.lock.json", "README.md", "LICENSE"],
       publishConfig: { access: "public", provenance: true },
       dependencies: {
         "@earendil-works/pi-tui": "^0.80.6",
@@ -143,11 +183,16 @@ describe("release package", () => {
       dependencies: { "@earendil-works/pi-tui": "^0.80.6" }
     };
     const files: Record<string, string> = {
+      "docs/CONFIGURATION.md": "# Fixture documentation\n",
+      "docs/CONFIGURATION.zh-CN.md": "# Fixture documentation\n",
+      "docs/PROVIDER_CONFIG.md": "# Fixture documentation\n",
+      "docs/PROVIDER_CONFIG.zh-CN.md": "# Fixture documentation\n",
       "LICENSE": "license",
       "README.md": "readme",
       "bin/zcode.js": "#!/usr/bin/env node\nimport { spawn } from \"node:child_process\";\n",
       "bin/zcode.ts": "export {};\n",
-      "config.example.json": "{}\n",
+      "setting.example.json": "{}\n",
+      "provider.example.json": "{}\n",
       "package.json": `${JSON.stringify(packageJson)}\n`,
       "src/app-server-client.ts": "export {};\n",
       "src/command.ts": "export {};\n",
@@ -178,6 +223,8 @@ describe("release package", () => {
       })}\n`,
       "vendor/node_modules/@zcode/tui/dist/index.js": "export const value = 1;\n",
       "vendor/node_modules/@zcode/tui/package.json": `${JSON.stringify(tuiPackage)}\n`,
+      "vendor/cli-config.cjs": "module.exports={};\n",
+      "vendor/provider/zcode-builtin.json": "{}\n",
       "vendor/zcode.cjs": "console.log('runtime');\n",
       "zcode-runtime.lock.json": `${JSON.stringify(lock)}\n`
     };

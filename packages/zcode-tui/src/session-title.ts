@@ -17,8 +17,12 @@ export function sessionTitleSpinnerFrame(elapsedMilliseconds: number, animated =
   return sessionTitleSpinnerFrames[frame % sessionTitleSpinnerFrames.length] ?? sessionTitleSpinnerFrames[0];
 }
 
+export function normalizeSessionTitle(title: string): string {
+  return sanitizeTerminalText(title).replace(/\s+/gu, " ").trim();
+}
+
 export function sessionTitleFromFirstMessage(message: string): string | null {
-  const normalized = sanitizeTerminalText(message).replace(/\s+/gu, " ").trim();
+  const normalized = normalizeSessionTitle(message);
   if (!normalized) {
     return null;
   }
@@ -34,6 +38,8 @@ export function emitSessionTerminalTitle(
   title: string
 ): void {
   if (!stream?.isTTY) return;
+  // This is the final boundary for both user input and persisted runtime titles.
+  const safeTitle = normalizeSessionTitle(title);
   // Empty title clears the terminal title, restoring the host's default label.
-  stream.write(title ? `\x1b]0;${SESSION_TITLE_PREFIX}${title}\x07` : "\x1b]0;\x07");
+  stream.write(safeTitle ? `\x1b]0;${SESSION_TITLE_PREFIX}${safeTitle}\x07` : "\x1b]0;\x07");
 }

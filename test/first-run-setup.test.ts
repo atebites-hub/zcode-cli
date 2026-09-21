@@ -3,12 +3,11 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import defaultUserConfig from "../config.example.json" with { type: "json" };
+import { writeProviderFixture } from "./fixtures/provider-config.ts";
 import {
-  desktopAuthSourcesPresent,
   planFirstRunTuiStart
 } from "../src/first-run-setup.ts";
-import { markSetupPending, userConfigPath } from "../src/model-access.ts";
+import { markSetupPending } from "../src/model-access.ts";
 
 const temporaryDirectories: string[] = [];
 
@@ -29,13 +28,7 @@ function linuxEnv(home: string): NodeJS.ProcessEnv {
 }
 
 async function writeCliConfig(home: string, apiKey?: string): Promise<void> {
-  const path = userConfigPath({ HOME: home, USERPROFILE: home });
-  await mkdir(join(home, ".zcode", "cli"), { recursive: true });
-  const config = structuredClone(defaultUserConfig) as {
-    provider: { zai: { options: { apiKey?: string } } };
-  };
-  if (apiKey !== undefined) config.provider.zai.options.apiKey = apiKey;
-  await writeFile(path, JSON.stringify(config));
+  await writeProviderFixture(linuxEnv(home), { apiKey });
 }
 
 describe("first-run TUI setup start plan", () => {
@@ -57,21 +50,8 @@ describe("first-run TUI setup start plan", () => {
       }
     });
 
-    expect(plan).toEqual({ action: "open-wizard", hydrateDesktopAuth: false });
+    expect(plan).toEqual({ action: "open-wizard" });
     expect(resolveCalls).toBe(0);
-  });
-
-  test("does not block first-run on desktop hydration when only CLI config exists", async () => {
-    const home = await temporaryHome();
-    const env = linuxEnv(home);
-    await writeCliConfig(home);
-    await markSetupPending(env);
-
-    expect(await desktopAuthSourcesPresent({
-      env,
-      fallbackHome: home,
-      platform: "linux"
-    })).toBe(false);
   });
 
   test("marks setup complete when the CLI already has an apiKey", async () => {
@@ -100,7 +80,7 @@ describe("first-run TUI setup start plan", () => {
     })).toEqual({ action: "idle" });
   });
 
-  test("allows desktop hydration only after the wizard is allowed to open when sources exist", async () => {
+  test("does not resolve legacy OAuth tokens before opening the native setup wizard", async () => {
     const home = await temporaryHome();
     const env = linuxEnv(home);
     await writeCliConfig(home);
@@ -120,12 +100,7 @@ describe("first-run TUI setup start plan", () => {
       }
     });
 
-    expect(plan).toEqual({ action: "open-wizard", hydrateDesktopAuth: true });
+    expect(plan).toEqual({ action: "open-wizard" });
     expect(resolveCalls).toBe(0);
-    expect(await desktopAuthSourcesPresent({
-      env,
-      fallbackHome: home,
-      platform: "linux"
-    })).toBe(true);
   });
 });

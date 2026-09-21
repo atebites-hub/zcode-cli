@@ -1,3 +1,4 @@
+import { writeProviderFixture } from "./fixtures/provider-config.ts";
 import { describe, expect, test } from "bun:test";
 
 import { createHash } from "node:crypto";
@@ -9,11 +10,11 @@ import { Readable } from "node:stream";
 
 import {
   clearSetupPending,
-  ensureUserConfig,
+  ensureCliSettings,
   markSetupPending,
   readConfiguredModelAccess,
   readSetupPending,
-  userConfigPath
+  cliSettingsPath
 } from "../src/model-access.ts";
 import {
   firstRunSetupEnv,
@@ -326,7 +327,7 @@ describe("launcher routing", () => {
     try {
       // First invocation creates the config via a non-TUI command (plugin list):
       // the pending marker must survive so the wizard still appears later.
-      const bootstrap = await ensureUserConfig(env);
+      const bootstrap = await ensureCliSettings(env);
       expect(bootstrap.created).toBe(true);
       await markSetupPending(env);
       expect(await readSetupPending(env)).toBe(true);
@@ -348,17 +349,12 @@ describe("launcher routing", () => {
     const home = await mkdtemp(join(tmpdir(), "zcode-setup-login-"));
     const env = { HOME: home, USERPROFILE: home };
     try {
-      await ensureUserConfig(env);
+      await ensureCliSettings(env);
       await markSetupPending(env);
 
       // `zcode login` succeeds and writes model access; the launcher then
       // clears the marker, so the next TUI start must not open the wizard.
-      const configuredPath = userConfigPath(env);
-      const config = JSON.parse(await readFile(configuredPath, "utf8")) as {
-        provider?: { zai?: { options?: { apiKey?: string } } };
-      };
-      config.provider!.zai!.options!.apiKey = "login-written-key";
-      await writeFile(configuredPath, JSON.stringify(config));
+      await writeProviderFixture(env, { apiKey: "login-written-key" });
       expect(await readConfiguredModelAccess(env)).not.toBeNull();
 
       await clearSetupPending(env);
@@ -438,7 +434,7 @@ describe("launcher routing", () => {
 
   test("recognizes TUI invocations after consuming global option values", () => {
     expect(isTuiRuntimeInvocation([])).toBe(true);
-    expect(isTuiRuntimeInvocation(["--cwd", "/tmp/project", "--mode", "plan", "tui"])).toBe(true);
+    expect(isTuiRuntimeInvocation(["--cwd", "/tmp/project", "--mode", "edit", "tui"])).toBe(true);
     expect(isTuiRuntimeInvocation(["--output-format", "json", "tui"], runtime39OptionTypes)).toBe(true);
     expect(isTuiRuntimeInvocation(["--browser-use", "headless", "--cwd", "/tmp/project", "tui"])).toBe(true);
     expect(isTuiRuntimeInvocation(["--surface", "terminal", "tui"])).toBe(false);
