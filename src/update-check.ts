@@ -7,7 +7,7 @@ import { compareReleaseVersions, parseReleaseVersion } from "../scripts/release-
 import { cliSettingsPath } from "./model-access.ts";
 
 export const UPDATE_CACHE_TTL_MS = 20 * 60 * 60 * 1_000;
-export const UPDATE_CHECK_URL = "https://registry.npmjs.org/zcode-app-cli/latest";
+export const UPDATE_CHECK_URL = "https://api.github.com/repos/atebites-hub/zcode-cli/releases/latest";
 
 interface UpdateCache {
   checkedVersion?: string;
@@ -56,7 +56,7 @@ export function updateCachePath(
   fallbackHome: string = homedir()
 ): string {
   const path = platform === "win32" ? win32 : posix;
-  return path.join(path.dirname(cliSettingsPath(env, platform, fallbackHome)), "version.json");
+  return path.join(path.dirname(cliSettingsPath(env, platform, fallbackHome)), "version-atebites-hub.json");
 }
 
 function parseUpdateCache(value: unknown): UpdateCache | undefined {
@@ -145,18 +145,37 @@ export async function refreshUpdateCache(options: RefreshUpdateCacheOptions): Pr
     const fetcher = options.fetcher ?? ((url, init) => fetch(url, init));
     const response = await fetcher(UPDATE_CHECK_URL, {
       headers: {
-        accept: "application/json",
-        "user-agent": `zcode-app-cli/${options.currentVersion}`
+        accept: "application/vnd.github+json",
+        "user-agent": `atebites-zcode-cli/${options.currentVersion}`
       },
       signal: controller.signal
     });
-    if (!response.ok) throw new Error(`npm registry returned HTTP ${response.status}.`);
+    // An unpublished fork has no latest release. Never fall back to the public
+    // npm package: installing it would replace the fork and its runtime patches.
+    if (response.status === 404) {
+      await writeUpdateCache(options.cachePath, {
+        checkedVersion: options.currentVersion,
+        latestVersion: options.currentVersion,
+        lastCheckedAt: new Date(options.now ?? Date.now()).toISOString()
+      });
+      return options.currentVersion;
+    }
+    if (!response.ok) throw new Error(`Fork release service returned HTTP ${response.status}.`);
     const body: unknown = await response.json();
-    const latestVersion = typeof body === "object" && body !== null && !Array.isArray(body)
-      ? (body as Record<string, unknown>).version
-      : undefined;
-    if (typeof latestVersion !== "string" || !parseReleaseVersion(latestVersion)) {
-      throw new Error("npm registry returned an invalid release version.");
+    const release = typeof body === "object" && body !== null && !Array.isArray(body)
+      ? body as Record<string, unknown> : undefined;
+    const tag = release?.tag_name;
+    const latestVersion = typeof tag === "string" ? tag.replace(/^v/u, "") : undefined;
+    const assets = release?.assets;
+    const hasPackage = typeof latestVersion === "string" && Array.isArray(assets) && assets.some(asset => {
+      if (!asset || typeof asset !== "object") return false;
+      const file = asset as Record<string, unknown>;
+      return file.name === `zcode-app-cli-${latestVersion}.tgz`
+        && file.browser_download_url === `https://github.com/atebites-hub/zcode-cli/releases/download/${tag}/${file.name}`;
+    });
+    if (release?.draft !== false || release?.prerelease !== false || !hasPackage
+      || typeof latestVersion !== "string" || !parseReleaseVersion(latestVersion)) {
+      throw new Error("Fork release is not a stable packaged release.");
     }
     await writeUpdateCache(options.cachePath, {
       checkedVersion: options.currentVersion,

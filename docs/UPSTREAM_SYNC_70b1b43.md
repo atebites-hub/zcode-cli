@@ -46,3 +46,16 @@ patches optional or remove their checks to make the release pass.
 
 Before merge: complete the runtime ports and override migration, run the full
 release build and pack/install validation, and obtain passing CI.
+
+## Fork update channel
+
+The notifier now checks only stable packaged releases from `atebites-hub/zcode-cli`,
+uses `version-atebites-hub.json`, and links to the fork release instead of recommending
+the upstream npm package. No released fork package exists yet. The inherited
+npm publishing workflow does not attach the tested tarball and still needs a fork
+release channel before distribution. This change does not implement unattended
+installation or update any active local checkout.
+
+Validation: 16 update-channel tests, TypeScript checking, and all three build
+bundles passed locally on 2026-09-21. Full release validation remains blocked by
+the runtime ports above.

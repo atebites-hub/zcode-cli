@@ -15,6 +15,13 @@ import {
   updateCheckDisabled
 } from "../src/update-check.ts";
 
+function forkRelease(version: string) {
+  const name = `zcode-app-cli-${version}.tgz`;
+  return { tag_name: `v${version}`, draft: false, prerelease: false, assets: [{
+    name, browser_download_url: `https://github.com/atebites-hub/zcode-cli/releases/download/v${version}/${name}`
+  }] };
+}
+
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
@@ -26,7 +33,7 @@ afterEach(async () => {
 async function temporaryCachePath(): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), "zcode-update-check-"));
   temporaryDirectories.push(directory);
-  return join(directory, ".zcode", "cli", "version.json");
+  return join(directory, ".zcode", "cli", "version-atebites-hub.json");
 }
 
 async function writeCache(
@@ -46,10 +53,10 @@ async function writeCache(
 describe("startup update check", () => {
   test("uses the cross-platform config directory and respects standard opt-outs", () => {
     expect(updateCachePath({ HOME: "/home/alice" }, "linux", "/fallback")).toBe(
-      "/home/alice/.zcode/cli/version.json"
+      "/home/alice/.zcode/cli/version-atebites-hub.json"
     );
     expect(updateCachePath({ USERPROFILE: "C:\\Users\\Alice" }, "win32", "C:\\fallback")).toBe(
-      "C:\\Users\\Alice\\.zcode\\cli\\version.json"
+      "C:\\Users\\Alice\\.zcode\\cli\\version-atebites-hub.json"
     );
     expect(updateCheckDisabled({ CI: "true" })).toBe(true);
     expect(updateCheckDisabled({ NO_UPDATE_NOTIFIER: "1" })).toBe(true);
@@ -131,7 +138,7 @@ describe("startup update check", () => {
     })).resolves.toBeUndefined();
   });
 
-  test("refreshes the npm latest version into an atomic cache", async () => {
+  test("refreshes the fork packaged release version into an atomic cache", async () => {
     const cachePath = await temporaryCachePath();
     const now = Date.parse("2026-07-14T12:00:00.000Z");
     let requestedUrl = "";
@@ -141,9 +148,9 @@ describe("startup update check", () => {
       currentVersion: "3.3.5-1",
       fetcher: async (url, init) => {
         requestedUrl = url;
-        expect(new Headers(init.headers).get("user-agent")).toBe("zcode-app-cli/3.3.5-1");
+        expect(new Headers(init.headers).get("user-agent")).toBe("atebites-zcode-cli/3.3.5-1");
         expect(init.signal).toBeInstanceOf(AbortSignal);
-        return new Response(JSON.stringify({ version: "3.3.5-2" }), {
+        return new Response(JSON.stringify(forkRelease("3.3.5-2")), {
           headers: { "content-type": "application/json" },
           status: 200
         });
@@ -165,7 +172,38 @@ describe("startup update check", () => {
     })).toMatchObject({ availableVersion: "3.3.5-2", refreshRequired: false });
   });
 
-  test("rejects registry errors without replacing the existing cache", async () => {
+  test("never falls back to npm when the fork has no release", async () => {
+    const cachePath = await temporaryCachePath();
+    const calls: string[] = [];
+    expect(await refreshUpdateCache({ cachePath, currentVersion: "3.3.5-1",
+      fetcher: async url => { calls.push(url); return new Response("missing", { status: 404 }); }
+    })).toBe("3.3.5-1");
+    expect(calls).toEqual(["https://api.github.com/repos/atebites-hub/zcode-cli/releases/latest"]);
+    expect((await readStartupUpdate({ cachePath, currentVersion: "3.3.5-1", env: {} }))?.availableVersion).toBeUndefined();
+  });
+
+  test.each([
+    { version: "3.3.5-2" },
+    { ...forkRelease("3.3.5-2"), draft: true },
+    { ...forkRelease("3.3.5-2"), prerelease: true },
+    { ...forkRelease("3.3.5-2"), assets: [] },
+    { ...forkRelease("3.3.5-2"), assets: [{ name: "zcode-app-cli-3.3.5-2.tgz", browser_download_url: "https://github.com/kingsword09/zcode-cli/releases/download/v3.3.5-2/zcode-app-cli-3.3.5-2.tgz" }] }
+  ])("rejects unpackaged or foreign releases: %j", async release => {
+    await expect(refreshUpdateCache({ cachePath: await temporaryCachePath(), currentVersion: "3.3.5-1",
+      fetcher: async () => Response.json(release)
+    })).rejects.toThrow("stable packaged release");
+  });
+
+  test("does not read the public npm cache shared with another installation", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "zcode-channel-"));
+    temporaryDirectories.push(directory);
+    await writeCache(join(directory, ".zcode", "cli", "version.json"), "99.0.0-1", Date.now(), "3.3.5-1");
+    const result = await readStartupUpdate({ currentVersion: "3.3.5-1", env: { HOME: directory, USERPROFILE: directory } });
+    expect(result?.availableVersion).toBeUndefined();
+    expect(result?.refreshRequired).toBe(true);
+  });
+
+  test("rejects release service errors without replacing the existing cache", async () => {
     const cachePath = await temporaryCachePath();
     const now = Date.parse("2026-07-14T12:00:00.000Z");
     await writeCache(cachePath, "3.3.5-2", now - UPDATE_CACHE_TTL_MS - 1, "3.3.5-1");
@@ -190,6 +228,8 @@ describe("update available view", () => {
     expect(output).toContain("✨ Update available! 3.3.5-1 → 3.3.5-2");
     expect(output).toContain(updateCommand);
     expect(output).toContain(releaseNotesUrl);
+    expect(releaseNotesUrl).toContain("atebites-hub/zcode-cli");
+    expect(output).not.toContain("npm install -g zcode-app-cli@latest");
   });
 
   test("keeps the routine update notice free of a full-width background", () => {

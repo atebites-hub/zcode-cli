@@ -20,10 +20,14 @@ redistribute the extracted runtime before publishing the npm package.
 
 ## Quick start
 
-```bash
-npm install -g zcode-app-cli@latest
-zcode
-```
+This is the `atebites-hub/zcode-cli` fork. Get a validated package from
+[the fork releases](https://github.com/atebites-hub/zcode-cli/releases), then install
+that downloaded `.tgz` with `npm install -g /absolute/path/to/the-package.tgz`.
+The public npm `zcode-app-cli@latest` channel belongs to upstream and does not
+preserve this fork's custom patches.
+
+The current upstream-sync branch is not release-ready; see
+[its validation status](./docs/UPSTREAM_SYNC_70b1b43.md).
 
 On first launch, ZCode creates `~/.zcode/cli/setting.json` (or
 `%USERPROFILE%\.zcode\cli\setting.json` on Windows) with credential-free
@@ -62,21 +66,21 @@ Node.js example, terminal/PTY requirements, and compatibility rules.
 
 ## Install and update
 
-```bash
-npm install -g zcode-app-cli@latest
-# or
-bun add -g zcode-app-cli@latest
-```
+Interactive startup checks this fork's GitHub Releases at most once every
+20 hours per installed version. It advertises only a stable release with a
+`zcode-app-cli-<version>.tgz` asset hosted in `atebites-hub/zcode-cli`, and links
+to that release. It does not install anything automatically or fall back to npm.
+The cache is separate from upstream's cache so another installation cannot
+supply an upstream update notice.
 
-Using `@latest` is intentional because the App-aligned release format uses a
-SemVer prerelease segment such as `3.3.5-2`. The tag always points to the
-newest validated App-plus-build release.
+There are currently no published fork packages. The release pipeline must attach
+the tested tarball before an update can be offered. Source-only tags, draft
+releases, and missing assets are not updates. The inherited npm publishing
+workflow is not a fork package distribution pipeline.
 
-Interactive startup checks the npm `latest` tag at most once every 20 hours
-per installed version and shows a cached newer version as a non-blocking
-update card with the exact install command and release-notes link. CI
-environments skip the check automatically. Set `ZCODE_DISABLE_UPDATE_CHECK=1`
-or `NO_UPDATE_NOTIFIER=1` to disable it.
+CI environments skip the check automatically. Set `ZCODE_DISABLE_UPDATE_CHECK=1`
+or `NO_UPDATE_NOTIFIER=1` to disable it. Desktop's updater updates Desktop itself;
+it does not rebuild this checkout or update ODW's pinned copies.
 
 A normal installation requires only Node.js and has no native PTY addon or
 postinstall build step.
